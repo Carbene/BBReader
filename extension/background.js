@@ -3,7 +3,7 @@ import {CAS_PERMISSION,SSO,renewLogin} from './auth.js';
 import {saveVault,readVault,deleteVault,validCredentials} from './vault.js';
 import { ORIGIN, PORTAL, DAY, campusDay, dailyDue, nextCheck, checkTime, cleanName, sameAccountLabel, browserFilename, readURL, bbURL, digest, calendarDate, attachmentName } from './core.js';
 const HOST = 'cn.sustech.bbreader', DAILY = 'daily-nine', RESUME = 'resume-job';
-let running = false, creatingParser, syncingReminders=false;
+let running = false, creatingParser, syncingReminders=false, activeDownloadCheck;
 const platform = chrome.runtime.getPlatformInfo();
 const get = async () => {
   const s=(await chrome.storage.local.get('state')).state || {courses:[],assignments:[],files:{},status:'尚未连接',warnings:[],enabled:true};
@@ -28,8 +28,9 @@ async function parse(html, url, kind) {
   const r = await chrome.runtime.sendMessage({target:'parser',html,url,kind});
   if (!r?.ok) throw new Error(r?.error || '页面解析失败'); return r.data;
 }
-async function request(url, method = 'GET') {
-  const r = await fetch(readURL(url), {method, credentials:'include', cache:'no-cache', signal:AbortSignal.timeout(20000)});
+async function request(url, method = 'GET', signal) {
+  const timeout=AbortSignal.timeout(20000),combined=signal?AbortSignal.any([signal,timeout]):timeout;
+  const r = await fetch(readURL(url), {method, credentials:'include', cache:'no-cache', signal:combined});
   if (r.status === 401 || r.status === 403 || !bbURL(r.url) || /\/login|\/cas\//.test(r.url)) throw new Error('需要重新登录 Blackboard');
   if (!r.ok) throw new Error(`Blackboard 返回 ${r.status}`); return r;
 }
@@ -183,69 +184,161 @@ async function pump() {
   if (s.job) await chrome.alarms.create(RESUME,{when:Date.now()+30000});
   else if (s.lastSync && !s.lastError) {
     if(s.integrationMode==='macos'&&s.remindersEnabled)await syncReminders().catch(()=>{});
-    await downloadBatch();
   }
 }
-let downloading = false;
+let downloading = false, downloadTimer;
+const downloadState=async()=>((await chrome.storage.local.get('downloadQueue')).downloadQueue)||{stopped:false,generation:0,items:[],batches:[]};
+const putDownloadState=value=>chrome.storage.local.set({downloadQueue:value});
+async function runDirectoryMigration(journal){
+  const helper=await native({op:'status'});if(!helper.capabilities?.includes('confirmed-directory-migration')||!helper.capabilities?.includes('migration-journal'))throw new Error('请先更新 macOS 本地助手后再迁移文件');
+  await native({op:'migrationJournal',action:'save',planId:journal.id,record:journal});
+  const scope=journal.scope,courseId=journal.courseId;
+  for(const item of (journal.migrate?journal.files:[])){
+    if(item.status==='complete'||item.status==='failed')continue;
+    try{
+      const relative=journal.migrate?(scope==='course'?item.relative.slice(2):item.relative):item.relative;
+      const result=await native({op:'relocate',courseId:item.courseId,sourcePath:item.sourcePath,relative:item.relative,targetRelative:relative,destinationRoot:journal.path,sha256:item.sha256});
+      if(!result.moved)throw new Error(result.preserved?'文件内容与索引不一致，保留原文件':'找不到原文件，保留原位置');
+      item.status='complete';item.path=result.path;item.relative=result.relative||relative;
+    }catch(e){item.status='failed';item.error=e.message;}
+    await chrome.storage.local.set({directoryMigration:journal});
+    await native({op:'migrationJournal',action:'save',planId:journal.id,record:journal});
+  }
+  const config=await native(scope==='course'?{op:'setCourse',courseId,path:journal.path}:{op:'setRoot',path:journal.path});
+  const s=await get();
+  for(const item of journal.files){
+    const f=s.files[item.key];if(!f)continue;
+    if(journal.migrate&&item.status==='complete'){f.savedPath=item.path;f.savedRelative=item.relative;f.relative=item.relative;}
+  }
+  await put(s);
+  const failed=journal.files.filter(f=>f.status==='failed').length;
+  if(failed){journal.committed=true;await chrome.storage.local.set({directoryMigration:journal});await native({op:'migrationJournal',action:'save',planId:journal.id,record:journal});}else{await native({op:'migrationJournal',action:'finish',planId:journal.id});await chrome.storage.local.remove('directoryMigration');}
+  return {...config,migrated:journal.files.filter(f=>f.status==='complete').length,failed};
+}
+async function queueDownloads(keys) {
+  const s=await get(),q=await downloadState();
+  if(s.job||running)throw new Error('课程检查完成后才能下载');
+  if(Object.keys((await chrome.storage.local.get('pending')).pending||{}).length)throw new Error('请等待已中止的下载收尾后再开始新任务');
+  if(!Array.isArray(keys)||!keys.length)throw new Error('请先选择要下载的课件');
+  const unique=[...new Set(keys)];
+  if(unique.length>5000)throw new Error('单次最多选择 5000 个文件，请分批下载');
+  const files=unique.map(key=>s.files[key]);
+  if(files.some(f=>!f||!s.courses.some(c=>c.id===f.courseId&&c.enabled)))throw new Error('所选课件已不存在或所属课程未启用，请刷新列表后重试');
+  const batchId=crypto.randomUUID(),batch={id:batchId,account:s.account,mode:s.integrationMode||'browser',created:Date.now(),keys:unique,status:'queued'};
+  const existing=new Set(q.items.filter(i=>['queued','running'].includes(i.status)).map(i=>i.key));
+  const additions=unique.filter(key=>!existing.has(key)).map(key=>({key,batchId,status:'queued'}));
+  batch.keys=additions.map(i=>i.key);
+  if(!batch.keys.length)throw new Error('所选课件已在下载队列中');
+  q.batches.push(batch);q.items.push(...additions);q.stopped=false;
+  await putDownloadState(q);await downloadBatch();
+  return {ok:true,batchId,queued:batch.keys.length};
+}
+async function stopDownloads() {
+  const q=await downloadState(),active=q.items.filter(i=>['queued','running'].includes(i.status));
+  if(!active.length)return {ok:true,stopped:q.stopped,stopping:!!q.stopping};
+  q.stopped=true;q.stopping=true;q.generation++;
+  for(const item of active)if(item.status==='queued')item.status='cancelled';
+  await putDownloadState(q);clearTimeout(downloadTimer);activeDownloadCheck?.abort();await chrome.alarms.clear('download-next');
+  const p=(await chrome.storage.local.get('pending')).pending||{};
+  const pendingKeys=new Set(Object.values(p).map(job=>job.file?.key));
+  for(const [token,job] of Object.entries(p)) {
+    const item=q.items.find(i=>i.key===job.file?.key&&i.status==='running');
+    if(!item)continue;
+    job.cancelRequested=true;p[token]=job;
+    if(job.id!==undefined)await chrome.downloads.cancel(job.id).catch(()=>{});
+  }
+  for(const item of q.items)if(item.status==='running'&&!pendingKeys.has(item.key))item.status='cancelled';
+  await putDownloadState(q);
+  await chrome.storage.local.set({pending:p});
+  if(Object.keys(p).length) {
+    await chrome.alarms.create('download-next',{when:Date.now()+1000});
+    await reconcileDownloads();
+  } else {
+    q.stopping=false;
+    await putDownloadState(q);
+  }
+  const latest=await downloadState();
+  return {ok:true,stopped:true,stopping:!!latest.stopping};
+}
+async function resumeDownloads(batchId) {
+  const q=await downloadState(),batch=q.batches.find(b=>b.id===batchId);
+  if(!batch)throw new Error('下载批次不存在，请重新选择课件');
+  if(batch.account!==(await get()).account)throw new Error('账户已改变，请重新选择课件');
+  if(downloading||q.items.some(i=>['queued','running'].includes(i.status)))throw new Error('请等待当前下载批次结束后再恢复');
+  if(Object.keys((await chrome.storage.local.get('pending')).pending||{}).length)throw new Error('请等待当前下载收尾');
+  for(const item of q.items)if(item.batchId===batchId&&item.status==='cancelled')item.status='queued';
+  batch.status='queued';q.stopped=false;q.generation++;
+  await putDownloadState(q);await downloadBatch();return {ok:true};
+}
 async function nextDownload() {
+  const q=await downloadState();if(q.stopped||!q.items.some(i=>i.status==='queued'))return;
   await chrome.alarms.create('download-next',{when:Date.now()+30000});
   // Continue this finite queue promptly; the alarm recovers if Chrome evicts the worker.
-  setTimeout(()=>downloadBatch().catch(()=>{}),1000);
+  clearTimeout(downloadTimer);downloadTimer=setTimeout(()=>downloadBatch().catch(()=>{}),1000);
 }
 async function downloadBatch() {
   if (downloading || syncingReminders) return; downloading=true;
   try {
     if(running || (await get()).job)return;
-    const s=await get(), pending=(await chrome.storage.local.get('pending')).pending || {};
+    const s=await get(), q=await downloadState(), pending=(await chrome.storage.local.get('pending')).pending || {};
     if (Object.keys(pending).length) { await reconcileDownloads(); return; }
+    if(q.stopped)return;
+    const queued=q.items.find(i=>i.status==='queued');
+    if(!queued){for(const b of q.batches)if(b.status==='queued'&&!q.items.some(i=>i.batchId===b.id&&['queued','running'].includes(i.status)))b.status='complete';await putDownloadState(q);return;}
+    const batch=q.batches.find(b=>b.id===queued.batchId),modeForState=s.integrationMode||'browser';
+    if(!batch||batch.account!==s.account||batch.mode!==modeForState){queued.status='failed';queued.error='账户或保存模式已改变';await putDownloadState(q);await nextDownload();return;}
+    const f=s.files[queued.key];
+    if(!f||!s.courses.some(c=>c.id===f.courseId&&c.enabled)){queued.status='failed';queued.error='文件索引已改变或课程未启用';await putDownloadState(q);await nextDownload();return;}
+    if(!await queueStillAllowed(queued.key,batch.id,q.generation))return;
+    queued.status='running';batch.status='running';await putDownloadState(q);
     const mode=s.integrationMode,browser=mode==='browser';
     if(!browser){
       let config;
-      try{config=await native({op:'status'});}catch{s.downloadStatus='本地助手未连接，请检查安装或切换到浏览器模式';await put(s);return;}
-      if(!config.root){s.downloadStatus='请先选择归档根目录';await put(s);return;}
+      try{config=await native({op:'status'});if(!config.capabilities?.includes('saved-path-validation'))throw new Error('请更新 macOS 本地助手后再下载');}catch(e){s.downloadStatus=e.message==='请更新 macOS 本地助手后再下载'?e.message:'本地助手未连接，请检查安装或切换到浏览器模式';await put(s);await finishQueueItem(queued.key,batch.id,'failed',s.downloadStatus);return;}
+      if(!config.root){s.downloadStatus='请先选择归档根目录';await put(s);await finishQueueItem(queued.key,batch.id,'failed',s.downloadStatus);return;}
     }
-    const f=Object.values(s.files).find(f=>s.courses.some(c=>c.id===f.courseId && c.enabled) && (f.checkedRun!==s.lastSync||(f.checkedMode||'macos')!==mode) && f.seen===s.lastRun);
-    if (!f) { s.downloadStatus='文件检查完成'; await put(s); return; }
+    if(!await queueStillAllowed(queued.key,batch.id,q.generation))return;
     s.downloadStatus=`正在核对：${f.name}`; await put(s);
-    if(!browser&&f.savedRelative&&f.sha256&&JSON.stringify(f.savedRelative)!==JSON.stringify(f.relative)){
-      try{
-        const relocated=await native({op:'relocate',courseId:f.courseId,sourceRelative:f.savedRelative,relative:f.relative,sha256:f.sha256});
-        if(relocated.moved)Object.assign(f,{savedPath:relocated.path,savedRelative:relocated.relative,sha256:relocated.sha256});
-      }catch(e){f.error=e.message;f.checkedRun=s.lastSync;f.checkedMode=mode;s.downloadStatus=`整理失败：${e.message}`;s.warnings.push(`${f.name}：${e.message}`);await put(s);await nextDownload();return;}
-    }
     let headers;
     try {
-      const h=await request(f.url,'HEAD');
+      activeDownloadCheck=new AbortController();
+      const h=await request(f.url,'HEAD',activeDownloadCheck.signal);
       if ((h.headers.get('content-type')||'').includes('text/html')) throw new Error('附件返回登录页或错误页面');
       f.archiveName=attachmentName(h.headers.get('content-disposition'),h.headers.get('content-type'),f.name);
       f.relative[f.relative.length-1]=f.archiveName;
       headers={etag:h.headers.get('etag'),modified:h.headers.get('last-modified'),size:h.headers.get('content-length')};
       const saved=browser?f.browserDownload:{path:f.savedPath,relative:f.savedRelative,headers:f.headers};
-      if (saved?.path && JSON.stringify(saved.relative)===JSON.stringify(f.relative) && (headers.etag || headers.modified) && JSON.stringify(headers)===JSON.stringify(saved.headers)) {
-        const exists=browser?(await chrome.downloads.search({id:saved.id}))[0]:await native({op:'exists',courseId:f.courseId,relative:f.savedRelative});
-        if(exists?.exists===true) { f.checkedRun=s.lastSync;f.checkedMode=mode;f.error=null; await put(s); await nextDownload(); return; }
+      if (saved?.path && (!browser||JSON.stringify(saved.relative)===JSON.stringify(f.relative)) && (headers.etag || headers.modified) && JSON.stringify(headers)===JSON.stringify(saved.headers)) {
+        const exists=browser?(await chrome.downloads.search({id:saved.id}))[0]:await native({op:'existsPath',path:f.savedPath});
+        if(exists?.exists===true) { f.error=null;await put(s);await finishQueueItem(queued.key,batch.id,'complete');await nextDownload();return; }
       }
     } catch(e) {
-      if(/重新登录|登录页/.test(e.message)) { s.downloadStatus=e.message; await put(s); return; }
+      if(activeDownloadCheck?.signal.aborted){await finishQueueItem(queued.key,batch.id,'cancelled');return;}
+      if(/重新登录|登录页/.test(e.message)) { s.downloadStatus=e.message;await put(s);await finishQueueItem(queued.key,batch.id,'failed',e.message);return; }
       headers=null; // Some servers reject HEAD; validate the completed download before recording it.
-    }
+    } finally {activeDownloadCheck=null;}
+    if(!await queueStillAllowed(queued.key,batch.id,q.generation))return;
+    if(!await queueStillAllowed(queued.key,batch.id,q.generation))return;
     await put(s);
     const token=crypto.randomUUID(), filename=browser?browserFilename(f.relative,(await platform).os):`BBReader-staging/${token}/${f.archiveName || cleanName(f.name)}`;
     // Persist intent before invoking downloads, so a worker restart cannot orphan a completed file.
-    await chrome.storage.local.set({pending:{[token]:{token,mode,file:f,headers,account:s.account,run:s.lastSync,started:Date.now()}}});
+    await chrome.storage.local.set({pending:{...pending,[token]:{token,mode,file:f,headers,account:s.account,run:s.lastSync,started:Date.now(),batchId:batch.id,generation:q.generation}}});
     await chrome.alarms.create('download-next',{when:Date.now()+60000});
     try {
       const id=await chrome.downloads.download({url:readURL(f.url),filename,saveAs:false,conflictAction:'uniquify'});
       const p=(await chrome.storage.local.get('pending')).pending || {};
-      if(p[token]) { p[token].id=id; await chrome.storage.local.set({pending:p}); }
+      const latest=await downloadState();
+      if(p[token]) { p[token].id=id; await chrome.storage.local.set({pending:p});if(latest.stopped||latest.generation!==q.generation){p[token].cancelRequested=true;await chrome.storage.local.set({pending:p});await chrome.downloads.cancel(id).catch(()=>{});await reconcileDownloads();return;} }
       await reconcileDownloads();
     } catch(e) {
-      await chrome.storage.local.set({pending:{}}); f.checkedRun=s.lastSync;f.checkedMode=mode;f.error=e.message;
-      s.downloadStatus=`下载失败：${e.message}`; s.warnings.push(`${f.name} 下载失败`); await put(s);
+      const p=(await chrome.storage.local.get('pending')).pending||{};delete p[token];await chrome.storage.local.set({pending:p});f.error=e.message;
+      s.downloadStatus=`下载失败：${e.message}`; s.warnings.push(`${f.name} 下载失败`); await put(s);await finishQueueItem(queued.key,batch.id,'failed',e.message);
       await nextDownload();
     }
   } finally { downloading=false; }
 }
+async function queueStillAllowed(key,batchId,generation){const q=await downloadState();return !q.stopped&&q.generation===generation&&q.items.some(i=>i.key===key&&i.batchId===batchId&&['queued','running'].includes(i.status));}
+async function finishQueueItem(key,batchId,status,error){const q=await downloadState(),item=q.items.find(i=>i.key===key&&i.batchId===batchId);if(item){item.status=status;if(error)item.error=error;}const batch=q.batches.find(b=>b.id===batchId);if(batch&&!q.items.some(i=>i.batchId===batchId&&['queued','running'].includes(i.status)))batch.status=status==='failed'?'failed':'complete';await putDownloadState(q);}
 let reconciling=false;
 async function reconcileDownloads() {
   if(reconciling)return;
@@ -264,6 +357,7 @@ async function reconcileDownloads() {
       }
       const s=await get(), f=s.files[job.file.key];
       try {
+        if(job.cancelRequested&&item?.state!=='complete') {if(mode==='macos'&&item?.filename)await native({op:'discardStaging',token,source:item.filename}).catch(()=>{});await finishQueueItem(job.file.key,job.batchId,'cancelled');delete p[token];await chrome.storage.local.set({pending:p});continue;}
         if(found.length>1)throw new Error('无法唯一识别下载记录，请重新检查文件');
         if(!item || item.state!=='complete') throw new Error(item?.error || '下载未完成');
         if(!f)throw new Error('文件索引已改变');
@@ -280,10 +374,15 @@ async function reconcileDownloads() {
         }
         Object.assign(f,{checkedRun:job.run,checkedMode:mode,error:null});
         s.downloadStatus=`已${browser?'下载':'归档'}：${f.name}`;
-      } catch(e) { if(f){f.checkedRun=job.run;f.checkedMode=mode;f.error=e.message;} s.downloadStatus=`保存失败：${e.message}`; s.warnings.push(`${job.file.name}：${e.message}`); }
+        await finishQueueItem(f.key,job.batchId,'complete');
+      } catch(e) { if(f){f.error=e.message;} s.downloadStatus=`保存失败：${e.message}`; s.warnings.push(`${job.file.name}：${e.message}`);await finishQueueItem(job.file.key,job.batchId,'failed',e.message); }
       await put(s); delete p[token]; await chrome.storage.local.set({pending:p});
     }
-    if(!Object.keys(p).length) await nextDownload();
+    if(!Object.keys(p).length) {
+      const q=await downloadState();
+      if(q.stopping){q.stopping=false;await putDownloadState(q);}
+      await nextDownload();
+    }
   } finally {reconciling=false;}
 }
 chrome.downloads.onChanged.addListener(d=>{if(d.state)reconcileDownloads().catch(()=>{});});
@@ -312,9 +411,18 @@ async function syncReminders(connect=false) {
   } catch(e) {const s=await get();s.remindersStatus=`提醒事项同步失败：${e.message}`;await put(s);throw e;}
   finally {syncingReminders=false;}
 }
-async function wake() { await arm(); const s=await get(); if(s.job)await pump(); else await start(true); }
+async function ensureDownloadUpgrade(){
+  const stored=(await chrome.storage.local.get('downloadQueue')).downloadQueue;
+  if(stored)return;
+  const q={stopped:false,generation:1,items:[],batches:[]};await putDownloadState(q);
+  const pending=(await chrome.storage.local.get('pending')).pending||{};
+  for(const job of Object.values(pending)){job.cancelRequested=true;if(job.id!==undefined)await chrome.downloads.cancel(job.id).catch(()=>{});}
+  await chrome.storage.local.set({pending});
+  if(Object.keys(pending).length)await chrome.alarms.create('download-next',{when:Date.now()+1000});
+}
+async function wake() { await arm();await ensureDownloadUpgrade();const migration=(await chrome.storage.local.get('directoryMigration')).directoryMigration;if(migration&&!migration.committed)await runDirectoryMigration(migration).catch(()=>{});const s=await get();if(s.job)await pump();else await start(true);await downloadBatch(); }
 chrome.runtime.onStartup.addListener(()=>wake());
-chrome.runtime.onInstalled.addListener(({reason}={})=>{arm();if(reason==='install')chrome.tabs.create({url:'index.html'});});
+chrome.runtime.onInstalled.addListener(({reason}={})=>{wake().catch(()=>{});if(reason==='install')chrome.tabs.create({url:'index.html'});});
 chrome.action.onClicked.addListener(()=>chrome.tabs.create({url:'index.html'}));
 chrome.runtime.onMessage.addListener((msg,sender,reply)=>{
   if(sender.id!==chrome.runtime.id || !sender.url?.startsWith(chrome.runtime.getURL('index.html')) || msg.target==='parser')return;
@@ -354,34 +462,49 @@ chrome.runtime.onMessage.addListener((msg,sender,reply)=>{
     if(msg.op==='syncReminders') return syncReminders();
     if(msg.op==='pauseReminders') {if(syncingReminders||running)throw new Error('请等待当前同步完成');const s=await get();s.remindersEnabled=false;s.remindersStatus='已暂停同步，现有提醒事项保留';await put(s);return {ok:true};}
     if(msg.op==='sync') { start().catch(()=>{});return {ok:true}; }
-    if(msg.op==='state') return {ok:true,state:await get(),platform:(await platform).os,nextCheck:(await chrome.alarms.get(DAILY))?.scheduledTime};
+    if(msg.op==='downloadFiles')return queueDownloads(msg.keys);
+    if(msg.op==='stopDownloads')return stopDownloads();
+    if(msg.op==='resumeDownloads')return resumeDownloads(msg.batchId);
+    if(msg.op==='retryDownloads') {const q=await downloadState(),batch=q.batches.find(b=>b.id===msg.batchId);if(!batch)throw new Error('下载批次不存在');if(downloading||q.items.some(i=>['queued','running'].includes(i.status)))throw new Error('请等待当前下载批次结束后再重试');const failed=q.items.filter(i=>i.batchId===batch.id&&i.status==='failed'&&(!msg.keys||msg.keys.includes(i.key)));if(!failed.length)throw new Error('没有可重试的文件');for(const i of failed){i.status='queued';i.error=null;}batch.status='queued';q.stopped=false;q.generation++;await putDownloadState(q);await downloadBatch();return {ok:true,queued:failed.length};}
+    if(msg.op==='state') return {ok:true,state:await get(),downloadQueue:await downloadState(),directoryMigration:(await chrome.storage.local.get('directoryMigration')).directoryMigration||null,platform:(await platform).os,nextCheck:(await chrome.alarms.get(DAILY))?.scheduledTime};
     if(msg.op==='settings') {if(running||downloading||reconciling||syncingReminders||(await get()).job)throw new Error('请等待本次检查完成');if(msg.checkTime!==undefined&&checkTime(msg.checkTime)!==msg.checkTime)throw new Error('无效的检查时间');const s=await get(); s.enabled=!!msg.enabled; s.courses.forEach(c=>c.enabled=msg.selected.includes(c.id)); if(msg.checkTime!==undefined)s.checkTime=msg.checkTime; await put(s);await arm();return {ok:true};}
     if(msg.op==='nativeStatus') {if((await get()).integrationMode!=='macos')throw new Error('未启用系统集成');return native({op:'status'});}
     if(msg.op==='chooseRoot'||msg.op==='chooseCourse') {
-      if(running||downloading||reconciling||syncingReminders||(await get()).job)throw new Error('请等待当前操作结束');
+      const dq=await downloadState();if(running||downloading||reconciling||syncingReminders||(await get()).job||dq.items.some(i=>['queued','running'].includes(i.status)))throw new Error('请先完成或中止当前操作');
       running=true;
       try {
         const s=await get(),course=msg.op==='chooseCourse'?s.courses.find(c=>c.id===msg.courseId):null;
         if(s.integrationMode!=='macos')throw new Error('请先启用 macOS 系统集成');
         if(msg.op==='chooseCourse'&&!course)throw new Error('未知课程');
         const config=await native({op:'status'});
+        if(!config.capabilities?.includes('confirmed-directory-migration')||!config.capabilities?.includes('migration-journal'))throw new Error('请先重新运行 0.4.0 安装包中的“安装本地助手.command”');
         let chosen;
         try {chosen=await chrome.runtime.sendNativeMessage('cn.sustech.bbreader.picker',{op:'chooseFolder',title:course?`选择 ${course.name} 的保存文件夹`:'选择课件保存根目录',directory:course?config.courses?.[course.id]||config.root:config.root});}
         catch {throw new Error('文件夹选择器未连接，请运行最新版安装包中的“安装本地助手.command”');}
         if(!chosen?.ok)throw new Error(chosen?.error||'文件夹选择器未响应');
         if(chosen.cancelled)return {ok:true,cancelled:true};
-        const result=await native(course?{op:'setCourse',courseId:course.id,path:chosen.path}:{op:'setRoot',path:chosen.path});
-        const latest=await get();for(const f of Object.values(latest.files)){if(!course||f.courseId===course.id)f.checkedRun=null;}await put(latest);
-        return result;
+        const currentPath=course?config.courses?.[course.id]||config.root:config.root;
+        if(chosen.path===currentPath)return {ok:true,root:config.root,courses:config.courses,unchanged:true};
+        const affected=Object.values(s.files).filter(f=>f.savedPath&&f.sha256&&(!course||f.courseId===course.id)&&(!course?!config.courses?.[f.courseId]:true));
+        const id=crypto.randomUUID(),plan={id,account:s.account,scope:course?'course':'root',courseId:course?.id,path:chosen.path,oldPath:currentPath,files:affected.map(f=>({key:f.key,name:f.name,courseId:f.courseId,sourcePath:f.savedPath,relative:f.relative,sha256:f.sha256,status:'pending'}))};
+        await chrome.storage.local.set({directoryPlan:plan});return {ok:true,prepared:true,plan};
       } finally {running=false;}
     }
-    if(msg.op==='files') {if(running||downloading||reconciling)throw new Error('请等待当前操作结束');const s=await get();for(const f of Object.values(s.files)){if(f.error){f.checkedRun=null;f.error=null;}}await put(s); downloadBatch().catch(()=>{});return {ok:true}; }
+    if(msg.op==='cancelDirectoryChange'){const plan=(await chrome.storage.local.get('directoryPlan')).directoryPlan;if(plan?.id===msg.planId)await chrome.storage.local.remove('directoryPlan');return {ok:true};}
+    if(msg.op==='commitDirectoryChange'){
+      const plan=(await chrome.storage.local.get('directoryPlan')).directoryPlan;if(!plan||plan.id!==msg.planId)throw new Error('保存目录预览已失效，请重新选择');
+      const q=await downloadState(),current=await get();if(plan.account!==current.account||plan.files.some(item=>{const f=current.files[item.key];return !f||f.savedPath!==item.sourcePath||f.sha256!==item.sha256;}))throw new Error('课件列表或保存位置已改变，请重新选择目录');
+      if(running||downloading||reconciling||q.items.some(i=>['queued','running'].includes(i.status))||Object.keys((await chrome.storage.local.get('pending')).pending||{}).length)throw new Error('请先完成或中止当前操作');
+      running=true;try{plan.migrate=msg.migrate===true;await chrome.storage.local.set({directoryMigration:plan});await chrome.storage.local.remove('directoryPlan');const result=await runDirectoryMigration(plan);return {ok:true,...result};}finally{running=false;}
+    }
+    if(msg.op==='retryMigration'){const journal=(await chrome.storage.local.get('directoryMigration')).directoryMigration;if(!journal)throw new Error('没有待恢复的迁移');for(const f of journal.files)if(f.status==='failed')f.status='pending';running=true;try{return {ok:true,...await runDirectoryMigration(journal)};}finally{running=false;}}
+    if(msg.op==='files') {throw new Error('请在课件归档中选择需要下载的文件');}
     if(msg.op==='feed') {
       const raw=(await (await request(`${ORIGIN}/webapps/calendar/calendarFeed/url`)).text()).trim();
       const match=raw.match(/https:\/\/bb\.sustech\.edu\.cn\/webapps\/calendar\/calendarFeed\/[^\s<>"']+/);
       if(!match)throw new Error('没有取得订阅链接，请到 Blackboard 日历中获取');return {ok:true,url:match[0].replace(/&amp;/g,'&')};
     }
-    if(msg.op==='reset') {if(running||downloading||reconciling||syncingReminders||(await get()).job)throw new Error('请等待检查结束');if(Object.keys((await chrome.storage.local.get('pending')).pending||{}).length)throw new Error('请等待下载结束'); await chrome.storage.local.remove('state');await deleteVault();return {ok:true};}
+    if(msg.op==='reset') {if(running||downloading||reconciling||syncingReminders||(await get()).job)throw new Error('请等待检查结束');if(Object.keys((await chrome.storage.local.get('pending')).pending||{}).length)throw new Error('请等待下载结束'); await chrome.storage.local.remove(['state','downloadQueue','directoryPlan','directoryMigration']);await deleteVault();return {ok:true};}
     throw new Error('未知操作');
   })().then(reply).catch(e=>reply({ok:false,error:e.message})); return true;
 });

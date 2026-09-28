@@ -66,14 +66,15 @@ test('failed detail preserves a previously known due date and records a warning'
   }finally{Date.now=realNow;failDetail=false;}
 });
 
-test('download -> native archive preserves filename, and a second scan skips unchanged files',async()=>{
+test('index scans never download; explicit macOS download archives and preserves files across scans',async()=>{
   let downloads=0,archives=0,relocations=0;
   const url=ORIGIN+'/bbcswebdav/pid-3-dt-content-rid-99_1/xid-99_1';
   const key='_1_1:99_1';
   db.state={integrationMode:'macos',account:'test',courses:[{...course,enabled:true}],assignments:[],warnings:[],enabled:true,lastSync:1,lastRun:1,files:{[key]:{key,id:'99_1',name:'Lecture',courseId:'_1_1',url,relative:['Term','Course','Lecture'],seen:1}}};
+  db.downloadQueue={stopped:false,generation:0,items:[],batches:[]};
   chrome.runtime.sendNativeMessage=async (_,msg)=>{
-    if(msg.op==='status')return{ok:true,root:'/archive'};
-    if(msg.op==='exists')return{ok:true,exists:true};
+    if(msg.op==='status')return{ok:true,root:'/archive',capabilities:['confirmed-directory-migration','saved-path-validation','migration-journal']};
+    if(msg.op==='existsPath')return{ok:true,exists:true};
     if(msg.op==='relocate'){
       relocations++;assert.deepEqual(msg.sourceRelative,['Term','Course','lecture.pdf']);assert.equal(msg.sha256,'test-hash');
       return{ok:true,moved:true,path:'/archive/'+msg.relative.join('/'),relative:msg.relative,sha256:msg.sha256};
@@ -84,18 +85,20 @@ test('download -> native archive preserves filename, and a second scan skips unc
   chrome.downloads.download=async()=>{downloads++;return 1;};
   chrome.downloads.search=async()=>[{state:'complete',danger:'safe',mime:'application/pdf',filename:'/downloads/BBReader-staging/fixture/lecture.pdf'}];
   globalThis.fetch=async u=>{const r=new Response(null,{headers:{'content-type':'application/pdf','etag':'v1','content-disposition':'attachment; filename="lecture.pdf"'}});Object.defineProperty(r,'url',{value:u});return r;};
-  await fire('download-next');await settle(()=>db.state.files[key].sha256);
+  const ask=msg=>new Promise(resolve=>chrome.runtime.onMessage.listeners[0](msg,{id:'test',url:chrome.runtime.getURL('index.html')},resolve));
+  await fire('resume-job');await settle(()=>db.state.lastSync&&!db.state.job);
+  assert.equal(downloads,0,'course indexing does not download files');
+  await ask({op:'downloadFiles',keys:[key]});await settle(()=>db.state.files[key].sha256);
   assert.equal(db.state.files[key].savedPath,'/archive/Term/Course/lecture.pdf');
   db.state.lastSync=2;
   await new Promise(r=>setImmediate(r));
-  await fire('download-next');await settle(()=>db.state.files[key].checkedRun===2);
+  await ask({op:'downloadFiles',keys:[key]});await settle(()=>db.downloadQueue.batches.length===2&&db.downloadQueue.batches[1].status==='complete');
   assert.equal(downloads,1);assert.equal(archives,1);
   db.state.lastSync=3;db.state.files[key].relative=['Term','Course','Lab 1','lecture.pdf'];
   await new Promise(r=>setImmediate(r));
-  await fire('download-next');await settle(()=>db.state.files[key].checkedRun===3);
-  assert.equal(relocations,1);assert.equal(downloads,1);assert.equal(archives,1);
-  assert.equal(db.state.files[key].savedPath,'/archive/Term/Course/Lab 1/lecture.pdf');
-  assert.deepEqual(db.state.files[key].savedRelative,db.state.files[key].relative);
+  await ask({op:'downloadFiles',keys:[key]});await settle(()=>db.downloadQueue.batches.length===3&&db.downloadQueue.batches[2].status==='complete');
+  assert.equal(relocations,0,'an indexing/path change does not silently migrate a saved file');assert.equal(downloads,1);assert.equal(archives,1);
+  assert.equal(db.state.files[key].savedPath,'/archive/Term/Course/lecture.pdf');
 });
 
 test('Reminders receives course titles and only checked selected assignments; completion is kept separate',async()=>{
@@ -127,19 +130,28 @@ test('a failed scan retains the CAS retry pause rather than overwriting it with 
   assert.equal(reads,1);assert.equal(db.state.authBlocked,true);assert.match(db.state.lastError,/学校拒绝/);
 });
 
-test('folder selection cancels without changes, saves root/course choices, and rescans only affected files',async()=>{
+test('macOS folder selection requires an explicit migration choice and never schedules downloads',async()=>{
   db.state={integrationMode:'macos',courses:[{id:'_1_1',name:'Course 1'}],assignments:[],files:{a:{courseId:'_1_1',checkedRun:7},b:{courseId:'_2_1',checkedRun:7}},warnings:[]};
   let cancel=true,saved=[],lastPicker;
   chrome.runtime.sendNativeMessage=async(host,msg)=>{
     if(host==='cn.sustech.bbreader.picker'){lastPicker=msg;return cancel?{ok:true,cancelled:true}:{ok:true,path:'/Users/fixture/chosen'};}
-    if(msg.op==='status')return {ok:true,root:'/Users/fixture/root',courses:{'_1_1':'/Users/fixture/course'}};
-    saved.push(msg);return {ok:true,root:'/Users/fixture/chosen',courses:{'_1_1':'/Users/fixture/chosen'}};
+    if(msg.op==='status')return {ok:true,root:'/Users/fixture/root',courses:{'_1_1':'/Users/fixture/course'},capabilities:['confirmed-directory-migration','saved-path-validation','migration-journal']};
+    saved.push(msg);if(msg.op==='relocate')return {ok:true,moved:true,path:'/Users/fixture/chosen/'+msg.targetRelative.join('/'),relative:msg.relative,sha256:msg.sha256};return {ok:true,root:'/Users/fixture/chosen',courses:{'_1_1':'/Users/fixture/chosen'}};
   };
   const ask=msg=>new Promise(resolve=>chrome.runtime.onMessage.listeners[0](msg,{id:'test',url:chrome.runtime.getURL('index.html')},resolve));
   const before=structuredClone(db.state);
   assert.equal((await ask({op:'chooseRoot'})).cancelled,true);assert.deepEqual(db.state,before);assert.equal(saved.length,0);
-  cancel=false;assert.equal((await ask({op:'chooseCourse',courseId:'_1_1'})).ok,true);
-  assert.equal(lastPicker.directory,'/Users/fixture/course');assert.equal(saved[0].op,'setCourse');assert.equal(saved[0].courseId,'_1_1');assert.equal(db.state.files.a.checkedRun,null);assert.equal(db.state.files.b.checkedRun,7);
-  assert.equal((await ask({op:'chooseRoot'})).ok,true);assert.equal(saved[1].op,'setRoot');assert.equal(db.state.files.b.checkedRun,null);
+  cancel=false;const coursePlan=await ask({op:'chooseCourse',courseId:'_1_1'});
+  assert.equal(coursePlan.prepared,true);assert.equal(lastPicker.directory,'/Users/fixture/course');assert.equal(saved.length,0);
+  assert.equal((await ask({op:'commitDirectoryChange',planId:coursePlan.plan.id,migrate:false})).ok,true);
+  assert.ok(saved.some(call=>call.op==='setCourse'&&call.courseId==='_1_1'));assert.equal(db.state.files.a.checkedRun,7);assert.equal(db.state.files.b.checkedRun,7);
+  const rootPlan=await ask({op:'chooseRoot'});assert.equal(rootPlan.prepared,true);
+  assert.equal((await ask({op:'commitDirectoryChange',planId:rootPlan.plan.id,migrate:false})).ok,true);assert.ok(saved.some(call=>call.op==='setRoot'));assert.equal(db.state.files.b.checkedRun,7);
   assert.equal((await ask({op:'chooseCourse',courseId:'_9_1'})).ok,false);
+  db.state.files.a={key:'a',courseId:'_1_1',name:'Lecture.pdf',savedPath:'/Users/fixture/old/Lecture.pdf',savedRelative:['Term','Course','Lecture.pdf'],relative:['Term','Course','Lecture.pdf'],sha256:'a'.repeat(64),checkedRun:7};
+  const migrationPlan=await ask({op:'chooseCourse',courseId:'_1_1'});assert.equal(migrationPlan.plan.files.length,1);
+  const moved=await ask({op:'commitDirectoryChange',planId:migrationPlan.plan.id,migrate:true});assert.equal(moved.ok,true);assert.equal(moved.migrated,1);assert.equal(moved.failed,0);
+  assert.equal(db.state.files.a.savedPath,'/Users/fixture/chosen/Lecture.pdf');
+  assert.ok(saved.some(call=>call.op==='relocate'&&call.sourcePath==='/Users/fixture/old/Lecture.pdf'));
+  assert.ok(saved.some(call=>call.op==='setRoot'));
 });

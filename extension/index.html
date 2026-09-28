@@ -27,9 +27,9 @@
   <header class="page-header">
     <div>
       <h1 id="title">作业日程</h1>
-      <p id="subtitle">截止日期一目了然，课件自动归位。</p>
+      <p id="subtitle">作业按期整理，课件按需归档。</p>
     </div>
-    <button id="sync" class="primary"><span class="spinner" aria-hidden="true"></span><span class="label">立即检查</span></button>
+    <div class="header-actions"><button id="stopDownloads" class="ghost danger" hidden>中止下载</button><button id="resumeDownloads" class="ghost" hidden>恢复下载</button><button id="sync" class="primary"><span class="spinner" aria-hidden="true"></span><span class="label">立即检查</span></button></div>
   </header>
 
   <div id="preview" hidden class="banner info">界面预览 · 示例数据，不代表已经连接 Blackboard</div>
@@ -48,8 +48,8 @@
     <h2>三步开始使用</h2>
     <ol>
       <li><b>登录 Blackboard</b><span>在当前 Chrome 中登录 bb.sustech.edu.cn；BBReader 复用这个登录状态，不保存密码。</span><button id="onboardLogin" class="text-button">前往学校登录 ↗</button></li>
-      <li><b>点击“立即检查”</b><span>自动读取当前学期的全部已注册课程、作业与课件。首次检查后才会开启每日自动检查。</span></li>
-      <li><b>挑选课程</b><span>在“我的课程”中取消不需要的课程，课件会下载到 下载目录 / BBReader。</span></li>
+      <li><b>点击“立即检查”</b><span>读取课程、作业和课件列表，不会自动下载附件。</span></li>
+      <li><b>选择课件下载</b><span>在“课件归档”下载全部课件、指定文件或所选文件。</span></li>
     </ol>
   </section>
 
@@ -94,9 +94,13 @@
     <div class="toolbar">
       <div id="fileSummary" class="file-summary"></div>
       <input id="fileSearch" type="search" placeholder="搜索文件" aria-label="搜索文件">
-      <button id="retryFiles" class="ghost">重试未完成的文件</button>
+      <button id="selectVisibleFiles" class="ghost">选择当前显示文件</button>
+      <button id="clearFileSelection" class="ghost">清空选择</button>
+      <button id="downloadSelected" class="primary" disabled>下载所选（0）</button>
+      <button id="downloadAll" class="ghost">全部下载</button>
       <button id="exportNotes" class="ghost">导出课程文字与链接</button>
     </div>
+    <p class="hint">检查只更新课件列表。选择文件后才会下载；“全部下载”范围为当前已启用课程的全部文件。</p>
     <p id="downloadStatus" class="hint"></p>
     <div id="fileList"></div>
   </section>
@@ -138,7 +142,7 @@
         <p>按学期和课程自动整理课件。</p>
         <p id="helper" class="path-display">浏览器下载目录 / BBReader / 学期 / 课程</p>
         <p id="browserDownloadHint" class="hint">可在浏览器设置中更改下载目录。同名文件保留新副本，已有文件不会被移动或覆盖。</p>
-        <div class="button-row" data-integrated hidden><button id="chooseRoot">选择文件夹…</button><button id="checkHelper" class="text-button">检查助手</button></div>
+        <div class="button-row" data-integrated hidden><button id="chooseRoot">选择文件夹…</button><button id="retryMigration" hidden>重试未完成迁移</button><button id="checkHelper" class="text-button">检查助手</button></div>
         <details data-integrated hidden><summary>安装帮助</summary><p>运行安装包中的“安装本地助手.command”，再在 Chrome 加载 extension 文件夹。</p></details>
       </article>
       <article class="settings-card">
@@ -178,6 +182,13 @@
 </main>
 
 <div id="message" role="status" class="toast" hidden></div>
+<dialog id="directoryMigrationDialog" aria-labelledby="directoryMigrationTitle">
+  <form method="dialog" class="migration-dialog">
+    <h2 id="directoryMigrationTitle">更改课件保存目录</h2>
+    <p id="directoryMigrationText"></p>
+    <div class="button-row"><button id="migrateDirectory" value="migrate" class="primary">迁移已有文件</button><button id="keepDirectory" value="keep">不迁移，仅更改目录</button><button id="cancelDirectory" value="cancel" class="ghost">取消切换</button></div>
+  </form>
+</dialog>
 <script type="module" src="ui.js"></script>
 </body>
 </html>

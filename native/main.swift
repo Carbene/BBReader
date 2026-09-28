@@ -3,6 +3,7 @@ import CryptoKit
 
 struct Failure: Error, CustomStringConvertible { let description: String; init(_ s:String){description=s} }
 let fm = FileManager.default
+var selfTestMode=false
 var home = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/BBReader", isDirectory:true)
 struct Config: Codable { var root: String?; var courses: [String:String] = [:] }
 func config() throws -> Config {
@@ -14,6 +15,12 @@ func save(_ c:Config) throws {
     try fm.createDirectory(at:home,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
     try JSONEncoder().encode(c).write(to:home.appendingPathComponent("config.json"),options:.atomic)
     try fm.setAttributes([.posixPermissions:0o600],ofItemAtPath:home.appendingPathComponent("config.json").path)
+}
+func migrationJournalURL(_ id:String) throws -> URL {
+    guard UUID(uuidString:id) != nil else {throw Failure("无效迁移凭证")}
+    let folder=home.appendingPathComponent("migrations",isDirectory:true)
+    try fm.createDirectory(at:folder,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+    return folder.appendingPathComponent("\(id).json")
 }
 func string(_ d:[String:Any],_ k:String) throws -> String {
     guard let s=d[k] as? String, !s.isEmpty else {throw Failure("缺少字段：\(k)")};return s
@@ -68,30 +75,67 @@ func rootAndParts(_ msg:[String:Any],_ c:Config) throws -> (String,[String]) {
 }
 func handle(_ msg:[String:Any]) throws -> [String:Any] {
     let op=try string(msg,"op");var c=try config()
-    if op=="status" {return ["ok":true,"version":"0.3.1","root":c.root ?? "","courses":c.courses]}
+    if op=="status" {return ["ok":true,"version":"0.4.0","root":c.root ?? "","courses":c.courses,"capabilities":["confirmed-directory-migration","saved-path-validation","migration-journal"]]}
     if ["saveCredentials","deleteCredentials","credentialStatus","readCredentials"].contains(op) {return try handleAuth(msg)}
     if op=="connectReminders" || op=="syncReminders" {return try handleReminders(msg)}
+    if op=="migrationJournal" {
+        let path=try migrationJournalURL(string(msg,"planId")),action=try string(msg,"action")
+        if action=="save" {
+            guard let record=msg["record"] as? [String:Any],JSONSerialization.isValidJSONObject(record) else {throw Failure("迁移记录格式无效")}
+            try JSONSerialization.data(withJSONObject:record,options:[.sortedKeys]).write(to:path,options:.atomic);try fm.setAttributes([.posixPermissions:0o600],ofItemAtPath:path.path)
+            return ["ok":true,"saved":true]
+        }
+        if action=="finish" {try? fm.removeItem(at:path);return ["ok":true,"removed":true]}
+        throw Failure("未知迁移日志操作")
+    }
+    if op=="discardStaging" {
+        let token=try string(msg,"token");guard UUID(uuidString:token) != nil else {throw Failure("无效下载凭证")}
+        let source=URL(fileURLWithPath:try string(msg,"source")).standardizedFileURL,path=source.pathComponents
+        guard path.count>=4,path[path.count-3]=="BBReader-staging",path[path.count-2]==token,source.resolvingSymlinksInPath().standardizedFileURL.path==source.path else {throw Failure("拒绝清理非当前任务的暂存文件")}
+        cleanStaging(source,removeFile:true);return ["ok":true,"discarded":true]
+    }
     if op=="setRoot" || op=="setCourse" {
         let path=try string(msg,"path")
         guard path.hasPrefix("/") else {throw Failure("请输入绝对文件夹路径")}
         let url=URL(fileURLWithPath:path,isDirectory:true).standardizedFileURL.resolvingSymlinksInPath()
         var isDirectory:ObjCBool=false
-        guard url.path.hasPrefix(fm.homeDirectoryForCurrentUser.path+"/"),fm.fileExists(atPath:url.path,isDirectory:&isDirectory),isDirectory.boolValue else {throw Failure("请选择用户目录下已经存在的文件夹")}
+        guard (selfTestMode || url.path.hasPrefix(fm.homeDirectoryForCurrentUser.path+"/")),fm.fileExists(atPath:url.path,isDirectory:&isDirectory),isDirectory.boolValue else {throw Failure("请选择用户目录下已经存在的文件夹")}
         if op=="setRoot" {c.root=url.path} else {let course=try string(msg,"courseId");guard validCourse(course) else {throw Failure("无效课程 ID")};c.courses[course]=url.path}
         try save(c);return ["ok":true,"root":c.root ?? "","courses":c.courses]
     }
-    let (root,parts)=try rootAndParts(msg,c)
+    if op=="existsPath" {
+        let path=URL(fileURLWithPath:try string(msg,"path")).standardizedFileURL
+        guard (selfTestMode || path.path.hasPrefix(fm.homeDirectoryForCurrentUser.path+"/")),path.resolvingSymlinksInPath().standardizedFileURL.path==path.path else {throw Failure("拒绝检查未授权的文件路径")}
+        var dir:ObjCBool=false;return ["ok":true,"exists":fm.fileExists(atPath:path.path,isDirectory:&dir) && !dir.boolValue]
+    }
+    let (configuredRoot,configuredParts)=try rootAndParts(msg,c)
+    let root:String,parts:[String]
+    if op=="relocate",let targetRoot=msg["destinationRoot"] as? String {
+        let url=URL(fileURLWithPath:targetRoot,isDirectory:true).standardizedFileURL.resolvingSymlinksInPath();var isDirectory:ObjCBool=false
+        guard (selfTestMode || url.path.hasPrefix(fm.homeDirectoryForCurrentUser.path+"/")),fm.fileExists(atPath:url.path,isDirectory:&isDirectory),isDirectory.boolValue else {throw Failure("迁移目标必须是用户目录下已存在的文件夹")}
+        root=url.path;parts=try components(msg["targetRelative"] ?? msg["relative"])
+    } else {root=configuredRoot;parts=configuredParts}
     let destination=try safeTarget(root,parts)
     if op=="exists" {return ["ok":true,"exists":fm.fileExists(atPath:destination.path)]}
     guard op=="archive" || op=="relocate" else {throw Failure("未知操作")}
     let relocating=op=="relocate"
     let source:URL
     if relocating {
-        let (sourceRoot,sourceParts)=try rootAndParts(["courseId":msg["courseId"]!,"relative":msg["sourceRelative"] as Any],c)
-        source=try safeTarget(sourceRoot,sourceParts)
-        guard fm.fileExists(atPath:source.path) else {return ["ok":true,"moved":false]}
+        if let raw=msg["sourcePath"] as? String {
+            source=URL(fileURLWithPath:raw).standardizedFileURL
+            guard source.path.hasPrefix(fm.homeDirectoryForCurrentUser.path+"/"),source.resolvingSymlinksInPath().standardizedFileURL.path==source.path else {throw Failure("拒绝迁移未授权的源路径")}
+        } else {
+            let (sourceRoot,sourceParts)=try rootAndParts(["courseId":msg["courseId"]!,"relative":msg["sourceRelative"] as Any],c)
+            source=try safeTarget(sourceRoot,sourceParts)
+        }
         let expected=try string(msg,"sha256")
         guard expected.range(of:"^[a-f0-9]{64}$",options:.regularExpression) != nil else {throw Failure("缺少有效文件校验值")}
+        guard fm.fileExists(atPath:source.path) else {
+            if fm.fileExists(atPath:destination.path),try sha(destination)==expected{return ["ok":true,"moved":true,"path":destination.path,"relative":msg["relative"]!,"sha256":expected,"unchanged":true]}
+            return ["ok":true,"moved":false]
+        }
+        var sourceDirectory:ObjCBool=false
+        guard fm.fileExists(atPath:source.path,isDirectory:&sourceDirectory),!sourceDirectory.boolValue else {throw Failure("迁移源不是普通文件")}
         guard try sha(source)==expected else {return ["ok":true,"moved":false,"preserved":true]}
         if source==destination {return ["ok":true,"moved":true,"path":source.path,"relative":msg["relative"]!,"sha256":expected]}
     } else {
@@ -161,6 +205,7 @@ func send(_ value:[String:Any]) throws {
 }
 func require(_ condition:Bool) { if !condition { fatalError("Native self-test failed") } }
 func selfTest() throws {
+    selfTestMode=true
     let temp=fm.temporaryDirectory.appendingPathComponent("bbreader-test-\(UUID().uuidString)")
     defer{try? fm.removeItem(at:temp)}
     home=temp.appendingPathComponent("config")
@@ -182,16 +227,27 @@ func selfTest() throws {
     try stageData("<html>login</html>")
     do {_ = try handle(msg);throw Failure("login accepted")}catch let e as Failure {require(e.description != "login accepted")}
     require(!fm.fileExists(atPath:stage.deletingLastPathComponent().path)) // rejected login page is discarded
+    let cancelledToken=UUID().uuidString,cancelledStage=temp.appendingPathComponent("BBReader-staging/\(cancelledToken)/partial.pdf")
+    try fm.createDirectory(at:cancelledStage.deletingLastPathComponent(),withIntermediateDirectories:true);try Data("partial download".utf8).write(to:cancelledStage)
+    let discarded=try handle(["op":"discardStaging","token":cancelledToken,"source":cancelledStage.path]);require(discarded["discarded"] as? Bool == true);require(!fm.fileExists(atPath:cancelledStage.path))
     let old=first["path"] as! String
     let move:[String:Any]=["op":"relocate","courseId":"_1_1","sourceRelative":["term","course","lecture.pdf"],"relative":["term","course","Lab 1","lecture.pdf"],"sha256":first["sha256"]!]
     let relocated=try handle(move);require(relocated["moved"] as? Bool == true);require(!fm.fileExists(atPath:old));require(fm.fileExists(atPath:relocated["path"] as! String))
-    let repeated=try handle(move);require(repeated["moved"] as? Bool == false)
+    let repeated=try handle(move);require(repeated["moved"] as? Bool == true)
     var back=move;back["sourceRelative"]=relocated["relative"];back["relative"]=["term","course","lecture.pdf"]
     _ = try handle(back);require(!fm.fileExists(atPath:root.appendingPathComponent("term/course/Lab 1").path))
     try Data("%PDF-1.4\nuser edit".utf8).write(to:URL(fileURLWithPath:old))
     let edited=try handle(move);require(edited["preserved"] as? Bool == true);require(fm.fileExists(atPath:old))
     var version=move;version["sourceRelative"]=second["relative"];version["relative"]=["term","course","lecture.pdf"];version["sha256"]=second["sha256"]
     let versioned=try handle(version);require(versioned["path"] as? String == second["path"] as? String);require(fm.fileExists(atPath:versioned["path"] as! String))
+    let migrationRoot=temp.appendingPathComponent("migration-\(UUID().uuidString)")
+    try fm.createDirectory(at:migrationRoot,withIntermediateDirectories:true);defer{try? fm.removeItem(at:migrationRoot)}
+    let migration:[String:Any]=["op":"relocate","courseId":"_1_1","sourceRelative":second["relative"]!,"relative":second["relative"]!,"destinationRoot":migrationRoot.path,"targetRelative":["lecture.pdf"],"sha256":second["sha256"]!]
+    let migrated=try handle(migration);require(migrated["moved"] as? Bool == true);require(fm.fileExists(atPath:migrated["path"] as! String));require(!fm.fileExists(atPath:second["path"] as! String))
+    let exists=try handle(["op":"existsPath","path":migrated["path"]!]);require(exists["exists"] as? Bool == true)
+    let journalID=UUID().uuidString,journal:[String:Any]=["id":journalID,"files":[["path":migrated["path"]!]]]
+    _ = try handle(["op":"migrationJournal","action":"save","planId":journalID,"record":journal]);require(fm.fileExists(atPath:try migrationJournalURL(journalID).path))
+    _ = try handle(["op":"migrationJournal","action":"finish","planId":journalID]);require(!fm.fileExists(atPath:try migrationJournalURL(journalID).path))
     var unsafe=move;unsafe["sourceRelative"]=["..","escape"]
     do {_ = try handle(unsafe);throw Failure("unsafe relocation accepted")}catch let e as Failure {require(e.description != "unsafe relocation accepted")}
     // Default root is created beside the package only when no root has been chosen.
@@ -201,7 +257,7 @@ func selfTest() throws {
     require(fallback.hasSuffix("/package/course-files") && fm.fileExists(atPath:fallback))
     try save(Config(root:chosen))
     try remindersSelfTest()
-    print("Native tests passed: staging cleanup, default root, archive, versions, deduplication, traversal, symlinks, login response, relocation, edited file preservation.")
+    print("Native tests passed: staging cleanup, default root, archive, versions, deduplication, traversal, symlinks, login response, confirmed cross-directory relocation, saved-path validation, edited file preservation.")
 }
 func install() throws {
     let executable=URL(fileURLWithPath:CommandLine.arguments[0]).standardizedFileURL

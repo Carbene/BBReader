@@ -18,39 +18,38 @@ globalThis.chrome={
   sendNativeMessage:async()=>{nativeCalls++;throw Error('No native helper installed');},sendMessage:async msg=>({ok:true,data:msg.kind==='identity'?{userId:'_42_1'}:msg.kind==='enrollments'?{terms:[{id:'_58_1',name:course.term,duration:'从 2026年7月10日 至 2027年3月1日'}],courses:[course]}:msg.kind==='course'?{valid:true,pages:[{url:page,title:'--Labs'}],files:[],assignments:[],notes:[]}:msg.kind==='content'?{valid:true,pages:[],files,assignments:[{id:'_3_1',title:'Homework',url:detail,status:'unknown'}],notes:[]}:msg.kind==='detail'?{status:'unknown',due:'2026-10-01T15:59:00Z'}:[]})},
  tabs:{async create(){return{id:1};},async get(){return {status:'complete',url:ORIGIN+'/webapps/portal/execute/tabs/tabAction'};},async remove(){}},
  scripting:{executeScript:async()=>[{result:{label:'Fixture',settingsURL:ORIGIN+'/webapps/portal/execute/tabs/tabAction?tab_tab_group_id=_1_1&forwardUrl=edit_module%2F_3_1%2Fbbcourseorg%3Fcmd%3Dedit'}}]},
- permissions:{contains:async()=>true},alarms:{async get(k){return alarms.get(k)||{name:k};},async create(k,v){alarms.set(k,v);},onAlarm:event()},action:{onClicked:event()},downloads:{onChanged:event(),async download(options){
+ permissions:{contains:async()=>true},alarms:{async get(k){return alarms.get(k)||{name:k};},async create(k,v){alarms.set(k,v);},async clear(k){alarms.delete(k);},onAlarm:event()},action:{onClicked:event()},downloads:{onChanged:event(),async download(options){
   downloadCalls++;assert.equal(options.saveAs,false);assert.equal(options.conflictAction,'uniquify');assert.match(options.filename,/^BBReader\/2026秋（Fall 2026）\/Course 2026 Fall\/Labs\/Lab 1\/file[12]\.pdf$/);
   const id=downloads.length;
   downloads.push({id,filename:'C:\\Users\\Fixture\\Downloads\\'+options.filename.replaceAll('/','\\'),url:options.url,finalUrl:options.url,state:'complete',danger:'safe',mime:'application/pdf',exists:true,fileSize:20,byExtensionId:'browser-test',startTime:new Date().toISOString()});return id;
- },async search(q){return downloads.filter(d=>q.id!==undefined?d.id===q.id:(!q.url||d.url===q.url)&&(!q.startedAfter||d.startTime>=q.startedAfter));}}
+ },async search(q){return downloads.filter(d=>q.id!==undefined?d.id===q.id:(!q.url||d.url===q.url)&&(!q.startedAfter||d.startTime>=q.startedAfter));},async cancel(id){const d=downloads.find(x=>x.id===id);if(d)d.state='interrupted';}}
 };
 globalThis.fetch=async (url,options)=>{const r=new Response(options?.method==='HEAD'?null:url.includes('calendarData')?'[]':'fixture',{headers:options?.method==='HEAD'?{'content-type':'application/pdf',etag:'v1'}:{'content-type':url.includes('calendarData')?'application/json':'text/html'}});Object.defineProperty(r,'url',{value:url});return r;};
 await import('../extension/background.js');
 const ask=msg=>new Promise(resolve=>chrome.runtime.onMessage.listeners[0](msg,{id:chrome.runtime.id,url:chrome.runtime.getURL('index.html')},resolve));
 async function settle(fn){for(let i=0;i<1000;i++){if(fn())return;await new Promise(r=>setImmediate(r));}throw Error('Worker did not settle');}
 async function tick(){chrome.alarms.onAlarm.listeners[0]({name:'download-next'});await new Promise(r=>setImmediate(r));}
-test('Windows browser-only scan, local completion, downloads, restart recovery and platform guards need no host',async()=>{
+test('Windows scan indexes only; explicit file batches download, resume safely and need no host',async()=>{
  const realNow=Date.now;Date.now=()=>Date.parse('2026-09-26T10:00:00+08:00');
  try{
   db.state={account:(await digest('Fixture')).slice(0,24),accountLabel:'Fixture',courses:[],assignments:[],files:{},warnings:[],enabled:true,integrationMode:'macos',credentialLogin:true,remindersEnabled:true};
   assert.equal((await ask({op:'state'})).state.integrationMode,'browser');
   await ask({op:'sync'});await settle(()=>db.state.job?.gradesQueued);
-  chrome.alarms.onAlarm.listeners[0]({name:'resume-job'});await settle(()=>Object.values(db.state.files).some(f=>f.browserDownload));
-  await tick();await settle(()=>Object.values(db.state.files).every(f=>f.browserDownload));
-  await tick();await settle(()=>db.state.downloadStatus==='文件检查完成');
-  assert.equal(downloadCalls,2);assert.equal(nativeCalls,0);
+  chrome.alarms.onAlarm.listeners[0]({name:'resume-job'});await settle(()=>db.state.lastSync&&!db.state.job);
+  assert.equal(Object.keys(db.state.files).length,2);assert.equal(downloadCalls,0,'index scans never download attachments');assert.equal(nativeCalls,0);
+  const keys=Object.keys(db.state.files);
+  const queued=await ask({op:'downloadFiles',keys});assert.equal(queued.ok,true);assert.equal(queued.queued,2);
+  await settle(()=>downloadCalls===1);await tick();await settle(()=>downloadCalls===2&&Object.values(db.state.files).every(f=>f.browserDownload));
   const [first,second]=Object.values(db.state.files);
   assert.equal(first.browserDownload.id,0,'download ID zero must be persisted');
   assert.match(first.browserDownload.path,/^C:\\Users\\Fixture\\Downloads\\BBReader\\/);
   assert.equal((await ask({op:'completeAssignment',courseId:'_1_1',id:'_3_1',completed:true})).ok,true);
   assert.equal(db.state.assignments[0].localCompleted,true);assert.equal(db.state.assignments[0].status,'unknown');
-  db.state.files[first.key].savedPath='/original/mac/file.pdf';db.state.files[first.key].sha256='preserved';db.state.lastSync++;
-  await tick();await settle(()=>db.state.files[first.key].checkedRun===db.state.lastSync);
-  await tick();await settle(()=>db.state.files[second.key].checkedRun===db.state.lastSync);
-  assert.equal(downloadCalls,2,'unchanged browser downloads are reused');assert.equal(db.state.files[first.key].savedPath,'/original/mac/file.pdf');
-  downloads[0].exists=false;db.state.lastSync++;
-  await tick();await settle(()=>downloadCalls===3&&db.state.files[first.key].checkedRun===db.state.lastSync);
-  assert.equal(db.state.files[first.key].browserDownload.id,2,'missing download is fetched again');
+  await ask({op:'downloadFiles',keys:[first.key]});await settle(()=>db.downloadQueue.batches.length===2&&db.downloadQueue.batches[1].status==='complete');
+  assert.equal(downloadCalls,2,'explicitly rechecking an unchanged file reuses its browser download');
+  downloads[0].exists=false;
+  await ask({op:'downloadFiles',keys:[first.key]});await settle(()=>downloadCalls===3&&db.state.files[first.key].browserDownload.id===2);
+  assert.equal(db.state.files[first.key].browserDownload.id,2,'explicit download fetches a missing file again');
   // Resume a download whose browser ID had not reached extension storage before worker shutdown.
   const recovered={...downloads[2],id:100,startTime:new Date(Date.now()+1).toISOString()};downloads.push(recovered);
   db.pending={restart:{mode:'browser',file:structuredClone(db.state.files[first.key]),headers:{etag:'v1'},account:db.state.account,run:db.state.lastSync,started:Date.now()}};
@@ -83,4 +82,33 @@ test('Windows browser-only scan, local completion, downloads, restart recovery a
   assert.equal((await ask({op:'integration',mode:'browser'})).ok,true);
   assert.equal((await ask({op:'state'})).state.integrationMode,'browser');
  }finally{Date.now=realNow;globalThis.setTimeout=realTimeout;}
+});
+
+test('stop during download creation cancels the returned ID and keeps later files out of the queue',async()=>{
+ const account=(await digest('Fixture')).slice(0,24),key='_1_1:stop';
+ db.state={account,integrationMode:'browser',courses:[{id:'_1_1',enabled:true}],files:{[key]:{key,id:'stop',name:'stop.pdf',courseId:'_1_1',url:ORIGIN+'/bbcswebdav/xid-stop',relative:['Term','Course','stop.pdf']}},warnings:[],lastSync:1};
+ db.downloadQueue={stopped:false,generation:0,items:[],batches:[]};delete db.pending;
+ let resolveDownload;
+ chrome.downloads.download=()=>new Promise(resolve=>{resolveDownload=()=>{downloads.push({id:40,url:ORIGIN+'/bbcswebdav/xid-stop',filename:'C:\\Fixture\\stop.pdf',state:'in_progress',byExtensionId:'browser-test',startTime:new Date().toISOString()});resolve(40);};});
+ const adding=ask({op:'downloadFiles',keys:[key]});await settle(()=>Object.keys(db.pending||{}).length===1);
+ assert.equal((await ask({op:'stopDownloads'})).ok,true);resolveDownload();await adding;await settle(()=>!Object.keys(db.pending||{}).length);
+ assert.equal(downloads.find(d=>d.id===40).state,'interrupted');
+ assert.equal(db.downloadQueue.stopped,true);assert.equal(db.downloadQueue.items[0].status,'cancelled');
+ assert.equal((await ask({op:'state'})).downloadQueue.items.length,1,'no files outside the selected batch are introduced');
+});
+
+test('stop stays pending until an active browser download reaches a terminal state',async()=>{
+ const account=(await digest('Fixture')).slice(0,24),key='_1_1:active-stop';
+ db.state={account,integrationMode:'browser',courses:[{id:'_1_1',enabled:true}],files:{[key]:{key,id:'active-stop',name:'active-stop.pdf',courseId:'_1_1',url:ORIGIN+'/bbcswebdav/xid-active-stop',relative:['Term','Course','active-stop.pdf']}},warnings:[],lastSync:1};
+ db.downloadQueue={stopped:false,generation:0,items:[],batches:[]};delete db.pending;
+ const oldDownload=chrome.downloads.download,oldCancel=chrome.downloads.cancel;
+ chrome.downloads.download=async()=>{downloads.push({id:41,url:ORIGIN+'/bbcswebdav/xid-active-stop',filename:'C:\\Fixture\\active-stop.pdf',state:'in_progress',byExtensionId:'browser-test',startTime:new Date().toISOString()});return 41;};
+ chrome.downloads.cancel=async()=>{}; // Simulate a browser that has not reported cancellation yet.
+ try {
+   const adding=ask({op:'downloadFiles',keys:[key]});await settle(()=>Object.keys(db.pending||{}).length===1);
+   await adding;const result=await ask({op:'stopDownloads'});
+   assert.equal(result.stopping,true);assert.equal(db.downloadQueue.stopping,true);
+   downloads.find(d=>d.id===41).state='interrupted';await tick();await settle(()=>!Object.keys(db.pending||{}).length);
+   assert.equal(db.downloadQueue.stopping,false);assert.equal(db.downloadQueue.items[0].status,'cancelled');
+ } finally {chrome.downloads.download=oldDownload;chrome.downloads.cancel=oldCancel;}
 });
