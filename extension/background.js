@@ -3,7 +3,7 @@ import {CAS_PERMISSION,SSO,renewLogin} from './auth.js';
 import {saveVault,readVault,deleteVault,validCredentials} from './vault.js';
 import { ORIGIN, PORTAL, DAY, campusDay, dailyDue, nextCheck, checkTime, cleanName, sameAccountLabel, browserFilename, readURL, bbURL, digest, calendarDate, attachmentName } from './core.js';
 const HOST = 'cn.sustech.bbreader', DAILY = 'daily-nine', RESUME = 'resume-job';
-let running = false, creatingParser, syncingReminders=false;
+let running = false, creatingParser, syncingReminders=false, queueActive=false;
 const platform = chrome.runtime.getPlatformInfo();
 const get = async () => {
   const s=(await chrome.storage.local.get('state')).state || {courses:[],assignments:[],files:{},status:'尚未连接',warnings:[],enabled:true};
@@ -79,7 +79,7 @@ async function start(automatic = false) {
   if (automatic && (!s.enabled || !s.account || !dailyDue(s.lastAutoDay,Date.now(),s.checkTime))) {running=false;return;}
   // Mark the attempt, not just success: login failure must not cause repeated daily scraping.
   if (automatic) s.lastAutoDay = campusDay();
-  s.status = '正在读取课程…'; s.warnings = []; await put(s);
+  s.status = '正在读取课程…'; s.warnings = []; s.downloadAbort=false; await put(s);
   try {
     const found = await discover(), identity = (await digest(ORIGIN+':'+found.userId)).slice(0,24);
     s=await get();
@@ -183,7 +183,9 @@ async function pump() {
   if (s.job) await chrome.alarms.create(RESUME,{when:Date.now()+30000});
   else if (s.lastSync && !s.lastError) {
     if(s.integrationMode==='macos'&&s.remindersEnabled)await syncReminders().catch(()=>{});
-    await downloadBatch();
+    // Index-only checks leave downloading to an explicit action from the files view.
+    if(s.autoDownload===false){ s.downloadStatus='索引已更新，未下载'; await put(s); }
+    else await downloadBatch();
   }
 }
 let downloading = false;
@@ -197,6 +199,8 @@ async function downloadBatch() {
   try {
     if(running || (await get()).job)return;
     const s=await get(), pending=(await chrome.storage.local.get('pending')).pending || {};
+    // An abort stops the batch until the user starts it again from the files view.
+    if (s.downloadAbort) return;
     if (Object.keys(pending).length) { await reconcileDownloads(); return; }
     const mode=s.integrationMode,browser=mode==='browser';
     if(!browser){
@@ -204,8 +208,9 @@ async function downloadBatch() {
       try{config=await native({op:'status'});}catch{s.downloadStatus='本地助手未连接，请检查安装或切换到浏览器模式';await put(s);return;}
       if(!config.root){s.downloadStatus='请先选择归档根目录';await put(s);return;}
     }
-    const f=Object.values(s.files).find(f=>s.courses.some(c=>c.id===f.courseId && c.enabled) && (f.checkedRun!==s.lastSync||(f.checkedMode||'macos')!==mode) && f.seen===s.lastRun);
-    if (!f) { s.downloadStatus='文件检查完成'; await put(s); return; }
+    const f=Object.values(s.files).find(f=>s.courses.some(c=>c.id===f.courseId && c.enabled) && f.wanted!==false && (f.checkedRun!==s.lastSync||(f.checkedMode||'macos')!==mode) && f.seen===s.lastRun);
+    if (!f) { queueActive=false; s.downloadStatus='文件检查完成'; await put(s); return; }
+    queueActive=true;
     s.downloadStatus=`正在核对：${f.name}`; await put(s);
     if(!browser&&f.savedRelative&&f.sha256&&JSON.stringify(f.savedRelative)!==JSON.stringify(f.relative)){
       try{
@@ -249,6 +254,8 @@ async function downloadBatch() {
 let reconciling=false;
 async function reconcileDownloads() {
   if(reconciling)return;
+  // Never re-arm the queue watchdog after an abort.
+  if((await get()).downloadAbort)return;
   if(running || syncingReminders){await chrome.alarms.create('download-next',{when:Date.now()+60000});return;}
   reconciling=true;
   try {
@@ -354,8 +361,8 @@ chrome.runtime.onMessage.addListener((msg,sender,reply)=>{
     if(msg.op==='syncReminders') return syncReminders();
     if(msg.op==='pauseReminders') {if(syncingReminders||running)throw new Error('请等待当前同步完成');const s=await get();s.remindersEnabled=false;s.remindersStatus='已暂停同步，现有提醒事项保留';await put(s);return {ok:true};}
     if(msg.op==='sync') { start().catch(()=>{});return {ok:true}; }
-    if(msg.op==='state') return {ok:true,state:await get(),platform:(await platform).os,nextCheck:(await chrome.alarms.get(DAILY))?.scheduledTime};
-    if(msg.op==='settings') {if(running||downloading||reconciling||syncingReminders||(await get()).job)throw new Error('请等待本次检查完成');if(msg.checkTime!==undefined&&checkTime(msg.checkTime)!==msg.checkTime)throw new Error('无效的检查时间');const s=await get(); s.enabled=!!msg.enabled; s.courses.forEach(c=>c.enabled=msg.selected.includes(c.id)); if(msg.checkTime!==undefined)s.checkTime=msg.checkTime; await put(s);await arm();return {ok:true};}
+    if(msg.op==='state') return {ok:true,state:await get(),platform:(await platform).os,nextCheck:(await chrome.alarms.get(DAILY))?.scheduledTime,downloading:!!(queueActive||downloading||reconciling)};
+    if(msg.op==='settings') {if(running||downloading||reconciling||syncingReminders||(await get()).job)throw new Error('请等待本次检查完成');if(msg.checkTime!==undefined&&checkTime(msg.checkTime)!==msg.checkTime)throw new Error('无效的检查时间');const s=await get(); s.enabled=!!msg.enabled; s.courses.forEach(c=>c.enabled=msg.selected.includes(c.id)); if(msg.checkTime!==undefined)s.checkTime=msg.checkTime; if(msg.autoDownload!==undefined)s.autoDownload=!!msg.autoDownload; await put(s);await arm();return {ok:true};}
     if(msg.op==='nativeStatus') {if((await get()).integrationMode!=='macos')throw new Error('未启用系统集成');return native({op:'status'});}
     if(msg.op==='chooseRoot'||msg.op==='chooseCourse') {
       if(running||downloading||reconciling||syncingReminders||(await get()).job)throw new Error('请等待当前操作结束');
@@ -375,7 +382,27 @@ chrome.runtime.onMessage.addListener((msg,sender,reply)=>{
         return result;
       } finally {running=false;}
     }
-    if(msg.op==='files') {if(running||downloading||reconciling)throw new Error('请等待当前操作结束');const s=await get();for(const f of Object.values(s.files)){if(f.error){f.checkedRun=null;f.error=null;}}await put(s); downloadBatch().catch(()=>{});return {ok:true}; }
+    if(msg.op==='files') {if(running||downloading||reconciling)throw new Error('请等待当前操作结束');const s=await get();s.downloadAbort=false;for(const f of Object.values(s.files)){if(f.error){f.checkedRun=null;f.error=null;}}await put(s); downloadBatch().catch(()=>{});return {ok:true}; }
+    if(msg.op==='fileSelection') {
+      if(running||downloading||reconciling||syncingReminders||(await get()).job)throw new Error('请等待本次检查完成');
+      if(!Array.isArray(msg.changed)||msg.changed.some(c=>!Array.isArray(c)||typeof c[1]!=='boolean'))throw new Error('无效的文件选择');
+      const s=await get();
+      // An absent flag means wanted, so only excluded files carry one and newly indexed files default in.
+      for(const [key,wanted] of msg.changed){const f=s.files[key];if(!f)continue;if(wanted)delete f.wanted;else f.wanted=false;}
+      await put(s);return {ok:true};
+    }
+    if(msg.op==='abortDownload') {
+      if(running||syncingReminders||(await get()).job)throw new Error('请等待本次检查完成');
+      const s=await get(); s.downloadAbort=true; s.downloadStatus='下载已中止，未保存的文件保留在列表中'; await put(s);
+      queueActive=false;
+      await chrome.alarms.clear('download-next');
+      const pending=(await chrome.storage.local.get('pending')).pending || {};
+      // Cancelling lets Chrome discard its partial file instead of leaving an orphan behind.
+      // A download whose ID has not been stored yet cannot be cancelled; it is retried later.
+      for(const job of Object.values(pending)) { try { if(job.id!==undefined) await chrome.downloads.cancel(job.id); } catch {} }
+      await chrome.storage.local.set({pending:{}});
+      return {ok:true};
+    }
     if(msg.op==='feed') {
       const raw=(await (await request(`${ORIGIN}/webapps/calendar/calendarFeed/url`)).text()).trim();
       const match=raw.match(/https:\/\/bb\.sustech\.edu\.cn\/webapps\/calendar\/calendarFeed\/[^\s<>"']+/);
