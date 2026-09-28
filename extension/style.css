@@ -203,6 +203,8 @@ section{padding-top:14px}
 .file small{display:block;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
 .file small.err{color:var(--warn)}
 .file a{font-size:12px;flex-shrink:0}
+.file.off{opacity:.62}
+.file input[type=checkbox]{flex-shrink:0;margin:0}
 
 /* Settings */
 #settings{max-width:980px}

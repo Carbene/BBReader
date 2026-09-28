@@ -94,10 +94,15 @@
     <div class="toolbar">
       <div id="fileSummary" class="file-summary"></div>
       <input id="fileSearch" type="search" placeholder="搜索文件" aria-label="搜索文件">
-      <button id="retryFiles" class="ghost">重试未完成的文件</button>
+      <button id="selectAllFiles" class="text-button" title="勾选当前显示的全部文件">全选</button>
+      <button id="selectNoFiles" class="text-button" title="取消勾选当前显示的全部文件">全不选</button>
+      <button id="downloadNow" class="ghost">下载未保存的文件</button>
+      <button id="abortDownload" class="ghost" disabled>中止下载</button>
       <button id="exportNotes" class="ghost">导出课程文字与链接</button>
     </div>
     <p id="downloadStatus" class="hint"></p>
+    <p class="hint">取消勾选的文件不会被下载；已经保存的课件不会被删除。</p>
+    <div id="fileSaveBar" class="save-bar" hidden><span id="fileSelection"></span><button id="saveFiles" class="primary">保存文件选择</button></div>
     <div id="fileList"></div>
   </section>
 
@@ -147,6 +152,8 @@
         <label class="time-field" for="checkTime">检查时间<input id="checkTime" type="time" step="300" value="09:00" required><span>校园时间 UTC+8</span></label>
         <p>休眠或关闭浏览器后，将在恢复时补查。首次需手动检查一次。</p>
         <p id="nextCheck" class="hint"></p>
+        <label class="switch"><input id="autoDownload" type="checkbox" role="switch" checked><span class="track" aria-hidden="true"></span>检查后自动下载课件</label>
+        <p>关闭后，「立即检查」只更新课程与文件索引；需要时到「课件归档」点击「下载未保存的文件」。进行中的下载可随时中止。</p>
         <div class="button-row"><button id="saveSchedule">保存设置</button></div>
       </article>
     </div>

@@ -20,8 +20,8 @@ globalThis.chrome={
     }},
   tabs:{async create(){portalCalls++;return{id:1};},async get(){return{status:'complete',url:ORIGIN+'/webapps/portal/execute/tabs/tabAction'};},async remove(){}},
   scripting:{executeScript:async()=>[{result:{label,settingsURL:ORIGIN+'/webapps/portal/execute/tabs/tabAction?tab_tab_group_id=_1_1&forwardUrl=edit_module%2F_3_1%2Fbbcourseorg%3Fcmd%3Dedit'}}]},
-  alarms:{async get(k){return alarms.get(k)||{name:k};},async create(k,v){alarms.set(k,v);},onAlarm:event()},
-  action:{onClicked:event()},downloads:{onChanged:event()},offscreen:{}
+  alarms:{async get(k){return alarms.get(k)||{name:k};},async create(k,v){alarms.set(k,v);},async clear(k){return alarms.delete(k);},onAlarm:event()},
+  action:{onClicked:event()},downloads:{onChanged:event(),cancelled:[],async cancel(id){this.cancelled.push(id);return true;}},offscreen:{}
 };
 globalThis.fetch=async url=>{
   requests++;
@@ -142,4 +142,108 @@ test('folder selection cancels without changes, saves root/course choices, and r
   assert.equal(lastPicker.directory,'/Users/fixture/course');assert.equal(saved[0].op,'setCourse');assert.equal(saved[0].courseId,'_1_1');assert.equal(db.state.files.a.checkedRun,null);assert.equal(db.state.files.b.checkedRun,7);
   assert.equal((await ask({op:'chooseRoot'})).ok,true);assert.equal(saved[1].op,'setRoot');assert.equal(db.state.files.b.checkedRun,null);
   assert.equal((await ask({op:'chooseCourse',courseId:'_9_1'})).ok,false);
+});
+
+// Index-only checks and aborting a queue are driven through the same message API the UI uses.
+const send=msg=>new Promise(resolve=>chrome.runtime.onMessage.listeners[0](msg,{id:'test',url:chrome.runtime.getURL('index.html')},resolve));
+const contentURL=ORIGIN+'/bbcswebdav/pid-3-dt-content-rid-99_1/xid-99_1';
+function serveAttachments(){
+  const previous=globalThis.fetch;
+  globalThis.fetch=async (url,options)=>{
+    const head=options?.method==='HEAD';
+    const r=new Response(head?null:url.includes('calendarData')?'[]':'fixture',{headers:head?{'content-type':'application/pdf',etag:'v1','content-disposition':'attachment; filename="lecture.pdf"'}:{'content-type':url.includes('calendarData')?'application/json':'text/html'}});
+    Object.defineProperty(r,'url',{value:url});return r;
+  };
+  return previous;
+}
+// The queue re-arms itself through a 1s timer; the browser suite disables it the same way so tests drive alarms explicitly.
+const quietQueue=()=>{const previous=globalThis.setTimeout;globalThis.setTimeout=(fn,ms,...args)=>ms===1000?0:previous(fn,ms,...args);return previous;};
+
+test('an index-only check leaves indexed files unsaved until the user downloads them',async()=>{
+  const fetchBack=serveAttachments(),timeoutBack=quietQueue();
+  const downloadBack=chrome.downloads.download,searchBack=chrome.downloads.search;
+  let downloadCalls=0;
+  chrome.downloads.download=async()=>{downloadCalls++;return 1;};
+  chrome.downloads.search=async()=>[{id:1,state:'complete',danger:'safe',mime:'application/pdf',filename:'C:\\downloads\\BBReader\\lecture.pdf',exists:true,fileSize:12}];
+  alarms.delete('download-next');
+  const realNow=Date.now;Date.now=()=>Date.parse('2026-09-28T10:00:00+08:00');
+  try{
+    // A pending job whose crawl already finished, so one pass reaches the end of the check.
+    db.state={account:'test',accountLabel:label,enabled:true,integrationMode:'browser',autoDownload:false,lastSync:10,lastRun:10,
+      courses:[{...course,enabled:true}],assignments:[],warnings:[],
+      job:{queue:[],seen:[],done:0,started:10,gradesQueued:true},
+      files:{'_1_1:99_1':{key:'_1_1:99_1',id:'99_1',name:'lecture.pdf',courseId:'_1_1',url:contentURL,relative:['Term','Test course','Lectures','lecture.pdf'],seen:10}}};
+    await send({op:'sync'});
+    await settle(()=>db.state.downloadStatus==='索引已更新，未下载');
+    assert.equal(db.state.job,null,'the check finished');
+    const indexed=Object.values(db.state.files);
+    assert.equal(indexed.length,1,'the index is kept');
+    assert.equal(indexed[0].seen,db.state.lastRun);
+    assert.equal(indexed[0].checkedRun,undefined,'nothing was archived');
+    assert.equal(downloadCalls,0,'an index-only check must not download');
+    assert.ok(!alarms.has('download-next'),'no queue watchdog is armed');
+    assert.equal((await send({op:'state'})).downloading,false,'an idle queue reports no activity');
+    assert.equal((await send({op:'files'})).ok,true);
+    await settle(()=>Object.values(db.state.files).every(f=>f.browserDownload));
+    assert.equal(downloadCalls,1,'the files view still downloads on demand');
+  }finally{Date.now=realNow;globalThis.setTimeout=timeoutBack;globalThis.fetch=fetchBack;chrome.downloads.download=downloadBack;chrome.downloads.search=searchBack;}
+});
+
+test('aborting a queue cancels the in-flight download, clears the watchdog and stays stopped',async()=>{
+  const fetchBack=serveAttachments(),timeoutBack=quietQueue();
+  const downloadBack=chrome.downloads.download,searchBack=chrome.downloads.search;
+  let downloadCalls=0;
+  chrome.downloads.cancelled.length=0;
+  chrome.downloads.download=async()=>{downloadCalls++;return 7;};
+  chrome.downloads.search=async()=>[{id:7,state:'in_progress',danger:'safe',mime:'application/pdf',filename:'C:\\downloads\\BBReader\\lecture.pdf',exists:true,fileSize:0}];
+  try{
+    delete db.pending;alarms.delete('download-next');
+    db.state={integrationMode:'browser',account:'test',courses:[{...course,enabled:true}],assignments:[],warnings:[],enabled:true,lastRun:5,lastSync:6,
+      files:{'_1_1:99_1':{key:'_1_1:99_1',id:'99_1',name:'lecture.pdf',courseId:'_1_1',url:contentURL,relative:['Term','Test course','Lectures','lecture.pdf'],seen:5}}};
+    assert.equal((await send({op:'files'})).ok,true);
+    await settle(()=>Object.keys(db.pending||{}).length);
+    assert.equal(downloadCalls,1);
+    assert.equal((await send({op:'state'})).downloading,true,'an armed queue reports activity');
+    assert.equal((await send({op:'abortDownload'})).ok,true);
+    assert.equal(db.state.downloadAbort,true);
+    assert.deepEqual(chrome.downloads.cancelled,[7],'the in-flight transfer is cancelled');
+    assert.equal(Object.keys(db.pending).length,0,'staged work is dropped');
+    assert.ok(!alarms.has('download-next'),'the watchdog is cleared');
+    assert.equal((await send({op:'state'})).downloading,false);
+    chrome.alarms.onAlarm.listeners[0]({name:'download-next'});await new Promise(r=>setImmediate(r));
+    assert.equal(downloadCalls,1,'an aborted queue stays stopped');
+    chrome.downloads.search=async()=>[{id:8,state:'complete',danger:'safe',mime:'application/pdf',filename:'C:\\downloads\\BBReader\\lecture.pdf',exists:true,fileSize:12}];
+    assert.equal((await send({op:'files'})).ok,true);
+    await settle(()=>downloadCalls===2);
+    assert.equal(db.state.downloadAbort,false,'an explicit download clears the abort');
+  }finally{globalThis.setTimeout=timeoutBack;globalThis.fetch=fetchBack;chrome.downloads.download=downloadBack;chrome.downloads.search=searchBack;}
+});
+
+test('unticked files are skipped and ticking them again downloads them',async()=>{
+  const fetchBack=serveAttachments(),timeoutBack=quietQueue();
+  const downloadBack=chrome.downloads.download,searchBack=chrome.downloads.search;
+  let downloadCalls=0;
+  chrome.downloads.download=async()=>{downloadCalls++;return downloadCalls;};
+  chrome.downloads.search=async q=>[{id:q.id,state:'complete',danger:'safe',mime:'application/pdf',filename:'C:\\downloads\\BBReader\\x.pdf',exists:true,fileSize:12}];
+  const entry=i=>({key:`_1_1:99${i}_1`,id:`99${i}_1`,name:`file${i}.pdf`,courseId:'_1_1',url:ORIGIN+`/bbcswebdav/xid-99${i}_1`,relative:['Term','Test course',`file${i}.pdf`],seen:5});
+  try{
+    delete db.pending;alarms.delete('download-next');
+    // The excluded file comes first in insertion order, so the queue would reach it first without the flag.
+    db.state={integrationMode:'browser',account:'test',courses:[{...course,enabled:true}],assignments:[],warnings:[],enabled:true,lastRun:5,lastSync:6,
+      files:{'_1_1:991_1':{...entry(1),wanted:false},'_1_1:992_1':entry(2)}};
+    assert.equal((await send({op:'files'})).ok,true);
+    await settle(()=>db.state.files['_1_1:992_1'].browserDownload);
+    assert.equal(downloadCalls,1,'the ticked file is downloaded');
+    assert.equal(db.state.files['_1_1:991_1'].browserDownload,undefined,'the unticked file is skipped even though it comes first');
+    assert.equal(db.state.files['_1_1:991_1'].checkedRun,undefined,'the unticked file is not even checked');
+    assert.equal((await send({op:'fileSelection',changed:'nope'})).ok,false,'a malformed selection is rejected');
+    assert.equal((await send({op:'fileSelection',changed:[['_1_1:991_1',true]]})).ok,true);
+    assert.equal('wanted' in db.state.files['_1_1:991_1'],false,'ticking a file again drops the exclusion');
+    assert.equal((await send({op:'files'})).ok,true);
+    await settle(()=>db.state.files['_1_1:991_1'].browserDownload);
+    assert.equal(downloadCalls,2,'the reticked file downloads on request');
+    assert.equal((await send({op:'fileSelection',changed:[['_1_1:992_1',false]]})).ok,true);
+    assert.equal(db.state.files['_1_1:992_1'].wanted,false,'exclusions are stored on the file');
+    assert.match(db.state.files['_1_1:992_1'].browserDownload.path,/x\.pdf$/,'unticking never deletes a saved file');
+  }finally{globalThis.setTimeout=timeoutBack;globalThis.fetch=fetchBack;chrome.downloads.download=downloadBack;chrome.downloads.search=searchBack;}
 });

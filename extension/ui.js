@@ -4,14 +4,14 @@ const $=id=>document.getElementById(id), demo=!globalThis.chrome?.runtime?.id;
 let archiveConfig={courses:{}},platformOS=demo?(new URLSearchParams(location.search).get('platform')||'mac'):null;
 let authBusy=false;
 let state={courses:[],assignments:[],files:{}}, month=new Date(), dayFilter=null;
-let filterValue='open',courseFilter='',query='',fileQuery='',courseDraft=null,noteTimer=null;
+let filterValue='open',courseFilter='',query='',fileQuery='',courseDraft=null,noteTimer=null,downloadActive=false,fileDraft=null,visibleFileKeys=[];
 const collapsedGroups=new Set();
 {const [y,m]=campusDay().split('-').map(Number);month=new Date(y,m-1,1);}
 const labels={unknown:'提交状态待核对',submitted:'已提交',graded:'已评阅'};
 const VIEWS={
   agenda:['作业日程','截止日期一目了然，课件自动归位。'],
   courses:['我的课程','当前学期的全部已注册课程，包括 Blackboard 首页隐藏的课程。'],
-  files:['课件归档','课件自动保存到本地，按学期、课程与内容目录整理。'],
+  files:['课件归档','课件按学期、课程与内容目录整理，可按需下载。'],
   settings:['连接与设置','运行模式、学校登录、日历订阅与同步记录。']
 };
 const PALETTE=['#2f7d6d','#3a6fbf','#b85a2c','#7a56b8','#a8456f','#2b8196','#8a6d17','#4f7f2a'];
@@ -45,12 +45,14 @@ function note(text){
   if(text)noteTimer=setTimeout(()=>{$('message').hidden=true;},7000);
 }
 function link(title,url){const a=el('a',title);if(/^https:\/\//.test(url||'')){a.href=url;a.target='_blank';a.rel='noreferrer';}return a;}
-async function refresh(){try{const response=await api({op:'state'}),previous=state.integrationMode;state=response.state;platformOS=response.platform||platformOS;if(state.integrationMode==='macos'&&previous!=='macos'){try{archiveConfig=await api({op:'nativeStatus'});}catch(e){archiveConfig={courses:{},error:e.message};}}render();$('nextCheck').textContent=state.enabled!==false&&response.nextCheck?`下次自动检查：${format(response.nextCheck)}（UTC+8）`:'';}catch(e){note(e.message);}}
+async function refresh(){try{const response=await api({op:'state'}),previous=state.integrationMode;state=response.state;downloadActive=!!response.downloading;platformOS=response.platform||platformOS;if(state.integrationMode==='macos'&&previous!=='macos'){try{archiveConfig=await api({op:'nativeStatus'});}catch(e){archiveConfig={courses:{},error:e.message};}}render();$('nextCheck').textContent=state.enabled!==false&&response.nextCheck?`下次自动检查：${format(response.nextCheck)}（UTC+8）`:'';}catch(e){note(e.message);}}
 const isDone=a=>state.integrationMode==='macos'?a.reminderCompleted===true||['submitted','graded'].includes(a.status):a.localCompleted??['submitted','graded'].includes(a.status);
 const enabledCourse=id=>state.courses.some(c=>c.id===id&&c.enabled);
 function activeAssignments(){return state.assignments.filter(a=>enabledCourse(a.courseId));}
 const activeFiles=()=>Object.values(state.files||{}).filter(f=>enabledCourse(f.courseId));
 const fileSaved=f=>state.integrationMode==='macos'?f.savedPath:f.browserDownload?.path;
+// Pending checkbox edits win over the stored flag, mirroring courseDraft; an absent flag means wanted.
+const fileWanted=f=>fileDraft?.has(f.key)?fileDraft.get(f.key):f.wanted!==false;
 
 function renderIntegration(){
   const integrated=state.integrationMode==='macos';
@@ -186,22 +188,43 @@ function renderFiles(){
   const saved=files.filter(fileSaved).length,failed=files.filter(f=>f.error).length,waiting=files.length-saved-failed;
   $('fileSummary').replaceChildren(...(files.length?[el('span',`共 ${files.length} 份`),el('span',`已保存 ${saved}`,'ok'),...(waiting>0?[el('span',`等待 ${waiting}`)]:[]),...(failed?[el('span',`失败 ${failed}`,'err')]:[])]:[]));
   $('fileList').replaceChildren();
+  visibleFileKeys=[];
   for(const c of state.courses.filter(c=>c.enabled)){
     const list=files.filter(f=>f.courseId===c.id&&(!q||`${f.name} ${fileSaved(f)||''}`.toLowerCase().includes(q))).sort((a,b)=>(a.name||'').localeCompare(b.name||'','zh-CN'));
     if(!list.length)continue;
     const group=el('details',undefined,'file-group'),summary=el('summary');group.style.setProperty('--course',courseColor(c.id));
     group.open=!!q||!collapsedGroups.has(c.id);group.ontoggle=()=>{if(!q)group.open?collapsedGroups.delete(c.id):collapsedGroups.add(c.id);};
-    summary.append(el('span',undefined,'swatch'),c.name,el('small',`${list.filter(fileSaved).length} / ${list.length} 已保存`));group.append(summary);
+    summary.append(el('span',undefined,'swatch'),c.name,el('small',`${list.filter(fileSaved).length} / ${list.length} 已保存 · 已选 ${list.filter(fileWanted).length}`));group.append(summary);
     for(const f of list){
-      const row=el('div',undefined,'file'),body=el('div'),path=fileSaved(f);
-      row.append(el('span',undefined,'state'+(f.error?' err':path?' ok':'')));
+      const row=el('div',undefined,'file'+(fileWanted(f)?'':' off')),body=el('div'),path=fileSaved(f);
+      const checkbox=el('input');checkbox.type='checkbox';checkbox.checked=fileWanted(f);checkbox.dataset.file=f.key;
+      checkbox.title='勾选后才会下载这个文件；取消勾选不会删除已保存的课件';
+      checkbox.setAttribute('aria-label',`下载文件：${f.name}`);
+      checkbox.onchange=()=>{draftFile(f.key,checkbox.checked);row.classList.toggle('off',!checkbox.checked);};
+      row.append(checkbox,el('span',undefined,'state'+(f.error?' err':path?' ok':'')));
       body.append(el('strong',f.name),el('small',f.error||path||'等待保存',f.error?'err':''));
-      row.append(body,link('原文件 ↗',f.url));group.append(row);
+      row.append(body,link('原文件 ↗',f.url));group.append(row);visibleFileKeys.push(f.key);
     }
     $('fileList').append(group);
   }
   if(!$('fileList').children.length){const empty=el('div',undefined,'empty');empty.append(el('b',files.length?'没有匹配的文件':'还没有课件'),files.length?'换个关键词试试。':'检查课程后，这里会显示课件与保存位置。');$('fileList').append(empty);}
-  $('downloadStatus').textContent=state.downloadStatus||'检查课程后，课件会自动保存到本地。';
+  $('downloadStatus').textContent=state.downloadStatus||(state.autoDownload===false?'检查课程后在此按需下载课件。':'检查课程后，课件会自动保存到本地。');
+  $('downloadNow').disabled=downloadActive;
+  $('abortDownload').disabled=!downloadActive;
+  updateFileBar();
+}
+// Edits are kept as a pending map rather than read back from the DOM, so the search filter cannot hide them.
+function draftFile(key,wanted){
+  const saved=state.files?.[key]?.wanted!==false;
+  fileDraft ||= new Map();
+  if(saved===wanted)fileDraft.delete(key);else fileDraft.set(key,wanted);
+  updateFileBar();
+}
+function updateFileBar(){
+  const files=activeFiles(),wanted=files.filter(fileWanted).length,dirty=!!fileDraft?.size;
+  $('fileSelection').textContent=files.length?`已选择 ${wanted} / ${files.length} 份文件${dirty?' · 有未保存的更改':''}`:'';
+  $('fileSaveBar').classList.toggle('dirty',dirty);$('fileSaveBar').hidden=!files.length;
+  $('saveFiles').disabled=!dirty;
 }
 
 function render(){
@@ -240,7 +263,7 @@ function showView(view){
   [$('title').textContent,$('subtitle').textContent]=VIEWS[view];
   document.title=`${VIEWS[view][0]} · BBReader`;
   if(location.hash!==`#/${view}`)history.replaceState(null,'',`#/${view}`);
-  if(view==='settings'){$('auto').checked=state.enabled!==false;$('checkTime').value=state.checkTime||'09:00';$('checkTime').disabled=!$('auto').checked;}
+  if(view==='settings'){$('auto').checked=state.enabled!==false;$('checkTime').value=state.checkTime||'09:00';$('checkTime').disabled=!$('auto').checked;$('autoDownload').checked=state.autoDownload!==false;}
   renderStatus();
 }
 document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>showView(b.dataset.view));
@@ -261,7 +284,7 @@ $('selectAll').onclick=()=>{document.querySelectorAll('[data-course]').forEach(b
 $('selectNone').onclick=()=>{document.querySelectorAll('[data-course]').forEach(b=>b.checked=false);updateCourseBar();};
 $('saveCourses').onclick=()=>run(async()=>{await api({op:'settings',enabled:state.enabled!==false,selected:[...document.querySelectorAll('[data-course]:checked')].map(x=>x.dataset.course)});courseDraft=null;await refresh();note('课程选择已保存，下次检查生效。');});
 $('auto').onchange=()=>{$('checkTime').disabled=!$('auto').checked;};
-$('saveSchedule').onclick=()=>run(async()=>{const time=$('checkTime').value;if(!/^\d{2}:\d{2}$/.test(time))throw new Error('请填写检查时间');await api({op:'settings',enabled:$('auto').checked,checkTime:time,selected:state.courses.filter(c=>c.enabled).map(c=>c.id)});await refresh();note($('auto').checked?`已保存：每天 ${time}（UTC+8）自动检查${state.remindersEnabled?'，完成后同步提醒事项':''}。`:'已关闭每日自动检查。');});
+$('saveSchedule').onclick=()=>run(async()=>{const time=$('checkTime').value;if(!/^\d{2}:\d{2}$/.test(time))throw new Error('请填写检查时间');await api({op:'settings',enabled:$('auto').checked,autoDownload:$('autoDownload').checked,checkTime:time,selected:state.courses.filter(c=>c.enabled).map(c=>c.id)});await refresh();note($('auto').checked?`已保存：每天 ${time}（UTC+8）自动检查${state.remindersEnabled?'，完成后同步提醒事项':''}。`:'已关闭每日自动检查。');});
 function helper(r){archiveConfig=r;renderIntegration();document.querySelectorAll('[data-course-path]').forEach(e=>e.textContent=r.courses?.[e.dataset.coursePath]||'使用默认根目录');}
 $('toggleIntegration').onclick=()=>run(async()=>{
   const mode=state.integrationMode==='macos'?'browser':'macos';
@@ -271,7 +294,11 @@ $('toggleIntegration').onclick=()=>run(async()=>{
 });
 $('chooseRoot').onclick=()=>run(async()=>{$('chooseRoot').disabled=true;try{note('请在 macOS 窗口中选择保存文件夹。');const r=await api({op:'chooseRoot'});if(r.cancelled){note('已取消，保存目录未更改。');return;}helper(r);note('保存文件夹已更新。');await api({op:'files'});}finally{$('chooseRoot').disabled=false;}});
 $('checkHelper').onclick=()=>run(async()=>helper(await api({op:'nativeStatus'})));
-$('retryFiles').onclick=()=>run(async()=>{await api({op:'files'});note('已开始检查尚未归档的文件。');});
+$('downloadNow').onclick=()=>run(async()=>{await api({op:'files'});note('已开始下载尚未保存的课件。');});
+$('abortDownload').onclick=()=>run(async()=>{await api({op:'abortDownload'});await refresh();note('已中止下载，未保存的文件仍列在下方。');});
+$('selectAllFiles').onclick=()=>{for(const key of visibleFileKeys)draftFile(key,true);renderFiles();};
+$('selectNoFiles').onclick=()=>{for(const key of visibleFileKeys)draftFile(key,false);renderFiles();};
+$('saveFiles').onclick=()=>run(async()=>{await api({op:'fileSelection',changed:[...(fileDraft||new Map())]});fileDraft=null;await refresh();note('文件选择已保存，下次下载按此执行。');});
 for(const op of ['connectReminders','syncReminders','pauseReminders'])$(op).onclick=()=>run(async()=>{$(op).disabled=true;try{note(op==='connectReminders'?'请在 macOS 提示中允许 BBReader Helper 访问提醒事项。':'正在同步提醒事项…');await api({op});await refresh();note(state.remindersStatus);}finally{$(op).disabled=false;}});
 for(const id of ['bannerLogin','onboardLogin'])$(id).onclick=()=>run(async()=>{await api({op:'openLogin'});note('完成学校登录后，点击“立即检查”。');});
 $('message').onclick=()=>note('');
