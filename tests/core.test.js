@@ -69,3 +69,16 @@ test('adjustable check time in campus time; invalid values fall back to 09:00',(
   for(const bad of ['24:00','9:00','09:60','x',undefined])assert.equal(checkTime(bad),'09:00');
   assert.equal(nextCheck(t,'bad'),nextNine(t));
 });
+
+test('an ignored file counts as handled: saved, matching a browser download, or explicitly ignored',async()=>{
+  const {isIgnoredFile,isHandledFile}=await import('../extension/core.js');
+  assert.equal(isIgnoredFile({ignored:true}),true);
+  for(const value of [undefined,null,{},{ignored:false},{ignored:'yes'},{ignored:1}])assert.equal(isIgnoredFile(value),false);
+  assert.equal(isHandledFile({ignored:true}),true);
+  assert.equal(isHandledFile({savedPath:'/archive/Term/Course/lecture.pdf'}),true);
+  assert.equal(isHandledFile({browserDownload:{id:0,path:'C:\\Downloads\\BBReader\\lecture.pdf'}}),true);
+  assert.equal(isHandledFile({browserDownload:{}}),false);
+  assert.equal(isHandledFile({}),false);
+  assert.equal(isHandledFile(null),false);
+  assert.equal(isHandledFile({ignored:false,error:'下载失败'}),false,'a failed download is not handled');
+});
