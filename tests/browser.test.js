@@ -85,6 +85,51 @@ test('Windows scan indexes only; explicit file batches download, resume safely a
  }finally{Date.now=realNow;globalThis.setTimeout=realTimeout;}
 });
 
+test('course opt-in survives scans, preserves other indexes and respects pause, cancellation and ignore',async()=>{
+ const oldParse=chrome.runtime.sendMessage,realNow=Date.now;
+ let now=Date.parse('2026-09-28T10:00:00+08:00');Date.now=()=>now;
+ const other={...course,id:'_2_1',name:'Other course',code:'CS200-2026FA',url:course.url.replace('_1_1','_2_1')};
+ chrome.runtime.sendMessage=async msg=>{
+  const r=await oldParse(msg);
+  if(msg.kind==='enrollments')r.data.courses=[course,other];
+  if(msg.kind==='course'&&msg.url.includes('id=_2_1'))r.data.pages=[{url:page.replace('_1_1','_2_1'),title:'--Labs'}];
+  return r;
+ };
+ const scan=async()=>{
+  now+=1000;await ask({op:'sync'});await settle(()=>db.state.job?.gradesQueued);
+  chrome.alarms.onAlarm.listeners[0]({name:'resume-job'});
+  await settle(()=>!db.state.job&&db.state.lastRun===now);
+  for(let i=0;i<30;i++)await new Promise(r=>setImmediate(r));
+ };
+ try{
+  os='win';db.state={account:(await digest('Fixture')).slice(0,24),accountLabel:'Fixture',courses:[],files:{},assignments:[],warnings:[],enabled:true,integrationMode:'browser'};
+  db.downloadQueue={stopped:false,generation:0,items:[],batches:[]};db.pending={};
+  const before=downloadCalls;
+  await scan();assert.equal(Object.keys(db.state.files).length,4);assert.equal(downloadCalls,before);
+  const selected=[course.id,other.id];
+  assert.equal((await ask({op:'settings',enabled:true,selected,autoDownload:['missing']})).ok,false);
+  assert.equal((await ask({op:'settings',enabled:true,selected,autoDownload:[course.id]})).ok,true);
+  await ask({op:'settings',enabled:true,selected,checkTime:'10:30'});
+  assert.equal(db.state.courses[0].autoDownload,true,'schedule updates preserve the course setting');
+  await scan();await settle(()=>db.downloadQueue.items[0]?.status==='complete');
+  assert.equal(db.state.courses[0].autoDownload,true,'rediscovery preserves opt-in');
+  assert.equal(db.state.courses[1].autoDownload,false);
+  assert.equal(downloadCalls,before+1);assert.equal(db.downloadQueue.items.length,2);
+  assert.ok(db.downloadQueue.items.every(i=>i.key.startsWith('_1_1:')));
+  assert.ok(Object.values(db.state.files).filter(f=>f.courseId===other.id).every(f=>!f.browserDownload),'other course files remain indexed without downloads');
+  const batch=db.downloadQueue.batches[0].id;
+  assert.equal((await ask({op:'stopDownloads'})).ok,true);
+  await scan();assert.equal(downloadCalls,before+1,'scanning does not undo pause');
+  assert.equal((await ask({op:'cancelDownloads',batchId:batch})).ok,true);
+  const first='_1_1:991_1',second='_1_1:992_1';
+  await ask({op:'downloadFiles',keys:[first]});
+  assert.equal((await ask({op:'ignoreFiles',keys:[first],ignored:true})).ok,true);
+  await scan();assert.equal(downloadCalls,before+1,'ignored and terminally cancelled files stay out of automatic batches');
+  assert.equal(db.state.files[first].ignored,true);assert.ok(db.state.files[second]);
+  assert.equal((await ask({op:'settings',enabled:true,selected,autoDownload:[]})).ok,true);
+  await scan();assert.equal(db.state.courses[0].autoDownload,false);assert.equal(Object.keys(db.state.files).length,4);
+ } finally {chrome.runtime.sendMessage=oldParse;Date.now=realNow;}
+});
 test('stop during download creation cancels the returned ID and keeps later files out of the queue',async()=>{
  const account=(await digest('Fixture')).slice(0,24),key='_1_1:stop';
  db.state={account,integrationMode:'browser',courses:[{id:'_1_1',enabled:true}],files:{[key]:{key,id:'stop',name:'stop.pdf',courseId:'_1_1',url:ORIGIN+'/bbcswebdav/xid-stop',relative:['Term','Course','stop.pdf']}},warnings:[],lastSync:1};

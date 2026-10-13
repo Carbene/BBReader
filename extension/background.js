@@ -88,7 +88,7 @@ async function start(automatic = false) {
       throw new Error('检测到不同 Blackboard 账户。请先在设置中清空本地索引，再连接该账户。已有文件不会删除。');
     }
     s.account ||= identity;s.accountIdentity=identity;s.accountLabel = found.label;s.currentTerm=found.term;
-    s.courses = found.courses.map(c=>({...c,enabled:s.courses.find(old=>old.id===c.id)?.enabled !== false}));
+    s.courses = found.courses.map(c=>({...c,enabled:s.courses.find(old=>old.id===c.id)?.enabled !== false,autoDownload:s.courses.find(old=>old.id===c.id)?.autoDownload === true}));
     const chosen = s.courses.filter(c=>c.enabled);
     s.job = {queue:chosen.map(c=>({kind:'course',courseId:c.id,url:c.url,path:[]})),seen:chosen.map(c=>`course:${c.url}`),done:0,started:Date.now()};
     s.status = `准备检查 ${chosen.length} 门课程`; await put(s);
@@ -184,6 +184,7 @@ async function pump() {
   if (s.job) await chrome.alarms.create(RESUME,{when:Date.now()+30000});
   else if (s.lastSync && !s.lastError) {
     if(s.integrationMode==='macos'&&s.remindersEnabled)await syncReminders().catch(()=>{});
+    await queueAutomaticDownloads().catch(async e=>{const current=await get();current.downloadStatus=`自动下载未启动：${e.message}`;await put(current);});
   }
 }
 let downloading = false, downloadTimer;
@@ -221,6 +222,18 @@ function downloadMessage(error) {
   const text=String(error?.message ?? error ?? '').trim();
   const code=text.toUpperCase();
   return {'USER_CANCELED':'用户取消下载','USER_SHUTDOWN':'浏览器退出，下载未完成','FILE_FAILED':'文件写入失败','FILE_ACCESS_DENIED':'没有权限保存该文件','FILE_NO_SPACE':'磁盘空间不足','FILE_NAME_TOO_LONG':'文件名过长','FILE_TOO_LARGE':'文件超过大小限制','FILE_VIRUS_INFECTED':'文件被安全检查拦截','SERVER_BAD_CONTENT':'服务器返回的内容无效','NETWORK_FAILED':'网络错误，下载失败','NETWORK_TIMEOUT':'网络超时，下载失败','NETWORK_DISCONNECTED':'网络已断开，下载失败','SERVER_UNAUTHORIZED':'需要重新登录 Blackboard','SERVER_FORBIDDEN':'服务器拒绝下载该文件'}[code]||text;
+}
+async function queueAutomaticDownloads() {
+  const s=await get(),q=await downloadState();
+  if(q.stopped||q.stopping||Object.keys((await chrome.storage.local.get('pending')).pending||{}).length)return;
+  const keys=Object.values(s.files).filter(f=>{
+    const lastBatch=[...q.batches].reverse().find(b=>b.keys?.includes(f.key));
+    return s.courses.some(c=>c.id===f.courseId&&c.enabled&&c.autoDownload===true)
+      &&f.seen===s.lastRun&&!isIgnoredFile(f)
+      &&(lastBatch?.status!=='cancelled'||q.items.some(i=>i.batchId===lastBatch.id&&i.key===f.key&&i.status==='complete'))
+      &&!q.items.some(i=>i.key===f.key&&['queued','running','cancelled'].includes(i.status));
+  }).map(f=>f.key);
+  if(keys.length)await queueDownloads(keys);
 }
 async function queueDownloads(keys) {
   const s=await get(),q=await downloadState();
@@ -521,7 +534,7 @@ chrome.runtime.onMessage.addListener((msg,sender,reply)=>{
     if(msg.op==='retryDownloads') {const q=await downloadState(),batch=q.batches.find(b=>b.id===msg.batchId);if(!batch)throw new Error('下载批次不存在');if(downloading||q.items.some(i=>['queued','running'].includes(i.status)))throw new Error('请等待当前下载批次结束后再重试');const failed=q.items.filter(i=>i.batchId===batch.id&&i.status==='failed'&&(!msg.keys||msg.keys.includes(i.key)));if(!failed.length)throw new Error('没有可重试的文件');for(const i of failed){i.status='queued';i.error=null;}batch.status='queued';q.stopped=false;q.generation++;await putDownloadState(q);await downloadBatch();return {ok:true,queued:failed.length};}
     if(msg.op==='cancelDownloads')return cancelDownloads(msg.batchId);
     if(msg.op==='state') return {ok:true,state:await get(),downloadQueue:await downloadState(),directoryMigration:(await chrome.storage.local.get('directoryMigration')).directoryMigration||null,platform:(await platform).os,nextCheck:(await chrome.alarms.get(DAILY))?.scheduledTime};
-    if(msg.op==='settings') {if(running||downloading||reconciling||syncingReminders||(await get()).job)throw new Error('请等待本次检查完成');if(msg.checkTime!==undefined&&checkTime(msg.checkTime)!==msg.checkTime)throw new Error('无效的检查时间');const s=await get(); s.enabled=!!msg.enabled; s.courses.forEach(c=>c.enabled=msg.selected.includes(c.id)); if(msg.checkTime!==undefined)s.checkTime=msg.checkTime; await put(s);await arm();return {ok:true};}
+    if(msg.op==='settings') {if(running||downloading||reconciling||syncingReminders||(await get()).job)throw new Error('请等待本次检查完成');if(msg.checkTime!==undefined&&checkTime(msg.checkTime)!==msg.checkTime)throw new Error('无效的检查时间');const s=await get(); s.enabled=!!msg.enabled; if(msg.autoDownload!==undefined&&(!Array.isArray(msg.autoDownload)||msg.autoDownload.some(id=>!s.courses.some(c=>c.id===id))))throw new Error('无效的自动下载课程'); s.courses.forEach(c=>{c.enabled=msg.selected.includes(c.id);if(msg.autoDownload!==undefined)c.autoDownload=msg.autoDownload.includes(c.id);}); if(msg.checkTime!==undefined)s.checkTime=msg.checkTime; await put(s);await arm();return {ok:true};}
     if(msg.op==='nativeStatus') {if((await get()).integrationMode!=='macos')throw new Error('未启用系统集成');return native({op:'status'});}
     if(msg.op==='chooseRoot'||msg.op==='chooseCourse') {
       const dq=await downloadState();if(running||downloading||reconciling||syncingReminders||(await get()).job||dq.items.some(i=>['queued','running'].includes(i.status)))throw new Error('请先完成或中止当前操作');

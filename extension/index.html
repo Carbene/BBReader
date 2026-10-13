@@ -48,7 +48,7 @@
     <h2>三步开始使用</h2>
     <ol>
       <li><b>登录 Blackboard</b><span>在当前 Chrome 中登录 bb.sustech.edu.cn；BBReader 复用这个登录状态，不保存密码。</span><button id="onboardLogin" class="text-button">前往学校登录 ↗</button></li>
-      <li><b>点击“立即检查”</b><span>读取课程、作业和课件列表，不会自动下载附件。</span></li>
+      <li><b>点击“立即检查”</b><span>读取课程、作业和课件列表；可在“我的课程”按课程开启自动下载。</span></li>
       <li><b>选择课件下载</b><span>在“课件归档”下载全部课件、指定文件或所选文件。</span></li>
     </ol>
   </section>
@@ -86,6 +86,7 @@
       <p id="courseScope" class="hint">检查后将自动读取当前学期的已注册课程。</p>
       <button id="selectAll" class="ghost">全选</button><button id="selectNone" class="ghost">全不选</button>
     </div>
+    <p class="hint">自动下载默认关闭。为需要的课程勾选“自动下载课件”并保存，下次检查完成后生效；其他课程仍保留扫描索引。</p>
     <div id="courseList" class="course-grid"></div>
     <div class="save-bar" id="courseSaveBar"><span id="courseSelection"></span><button id="saveCourses" class="primary">保存课程选择</button></div>
   </section>
@@ -103,9 +104,9 @@
       <button id="toggleIgnoredFiles" class="ghost" aria-pressed="false" hidden>显示已忽略</button>
       <button id="exportNotes" class="ghost">导出课程文字与链接</button>
     </div>
-    <p class="hint">检查只更新课件列表。选择文件后才会下载；“全部下载”范围为当前已启用课程中尚未忽略的全部文件。</p>
-    <p class="hint">被忽略的课件会按“已下载”处理：不再出现在默认列表中，也不会进入“全部下载”或“下载所选”，直到你取消忽略。</p>
-    <p class="hint">“暂停下载”只是暂停，之后仍可点击“恢复下载”；如果确定不再需要这批文件，用“取消下载”将它们移出队列，暂停的下载不会被保留。</p>
+    <p class="hint">扫描保留课件索引；仅开启“自动下载课件”的课程会在检查后自动下载，其余课程可手动下载；“全部下载”范围为当前已启用课程中尚未忽略的全部文件。</p>
+    <p class="hint">被忽略的课件会按“已下载”处理：不再出现在默认列表中，也不会自动下载或进入“全部下载”或“下载所选”，直到你取消忽略。</p>
+    <p class="hint">“暂停下载”只是暂停，之后仍可点击“恢复下载”；如果确定不再需要这批文件，用“取消下载”将它们移出队列，暂停的下载不会被保留。暂停后自动下载也会停止，需手动开始或恢复下载才会继续；取消的文件不会被下次扫描重新加入，仍可手动下载。</p>
     <p id="downloadStatus" class="hint"></p>
     <div id="fileList"></div>
   </section>

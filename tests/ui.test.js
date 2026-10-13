@@ -106,3 +106,28 @@ test('the archive renderer handles saved, paused, failed, and ignored files with
   context.renderFiles();assert.equal(elements.unignoreSelected.disabled,true);
   context.selectedFiles.clear();context.renderFiles();
 });
+
+test('course auto-download choices are independent, survive redraw and are saved with scan choices',async()=>{
+  const {context,elements}=fileView();
+  for(const id of ['courseList','courseSelection','courseSaveBar','saveCourses'])elements[id]={children:[],dataset:{},classList:{toggle(){}},append(...nodes){this.children.push(...nodes);},replaceChildren(...nodes){this.children=nodes;}};
+  const flatten=nodes=>nodes.flatMap(n=>[n,...flatten(n.children||[])]);
+  context.document.querySelectorAll=selector=>{
+    const field=selector.includes('auto-download')?'autoDownload':'course';
+    return flatten(elements.courseList.children).filter(n=>n.dataset?.[field]!==undefined&&(!selector.endsWith(':checked')||n.checked));
+  };
+  const create=context.document.createElement;
+  context.document.createElement=tag=>({...create(tag),closest:()=>({classList:{toggle(){}}})});
+  context.courseDraft=null;context.autoDownloadDraft=null;context.archiveConfig={courses:{}};
+  context.state={integrationMode:'browser',enabled:true,courses:[{id:'a',name:'A',enabled:true},{id:'b',name:'B',enabled:true},{id:'c',name:'C',enabled:false}]};
+  context.renderCourses();
+  let auto=context.document.querySelectorAll('[data-auto-download]');
+  assert.ok(auto.every(b=>!b.checked));assert.equal(auto[2].disabled,true);
+  auto[0].checked=true;auto[0].onchange();assert.equal(elements.saveCourses.disabled,false);
+  context.renderCourses();auto=context.document.querySelectorAll('[data-auto-download]');
+  assert.equal(auto[0].checked,true);assert.equal(auto[1].checked,false);
+  let saved;context.api=async msg=>{saved=msg;return {ok:true};};
+  vm.runInContext(uiSource().split('\n').find(line=>line.startsWith("$('saveCourses').onclick=")),context);
+  await elements.saveCourses.onclick();
+  assert.deepEqual(Array.from(saved.selected),['a','b']);assert.deepEqual(Array.from(saved.autoDownload),['a']);
+  assert.equal(context.courseDraft,null);assert.equal(context.autoDownloadDraft,null);
+});
