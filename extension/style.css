@@ -185,7 +185,7 @@ section{padding-top:14px}
 
 /* Files */
 .file-summary{display:flex;gap:8px;flex-wrap:wrap;margin-right:auto;font-size:12px}
-.file-summary span{padding:3px 10px;border-radius:20px;background:var(--line-2);color:var(--ink-2)}
+.file-summary span,.file-summary button{padding:3px 10px;border-radius:20px;background:var(--line-2);color:var(--ink-2)}
 .file-summary .ok{background:var(--ok-soft);color:var(--ok)}
 .file-summary .err{background:var(--warn-soft);color:var(--warn)}
 .file-group{--course:var(--accent);background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);margin-bottom:12px;box-shadow:var(--shadow);overflow:hidden}
@@ -315,3 +315,6 @@ footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin
 .segmented.static{margin-right:0}
 
 .course>label.course-download{font-size:13px;margin-left:22px;align-items:center}
+
+.file-summary button{font:inherit;border:1px solid transparent;cursor:pointer}
+.file-summary button[aria-pressed="true"]{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}

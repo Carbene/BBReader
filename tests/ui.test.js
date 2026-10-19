@@ -41,7 +41,7 @@ function fileView(){
   const start=source.indexOf('const activeFiles='),end=source.indexOf('function render(){');
   assert.ok(start>0&&end>start,'the archive renderer is sliceable for testing');
   const context=vm.createContext({
-    document,$:id=>elements[id],state:{},downloadQueue:{items:[],batches:[],stopped:false},fileQuery:'',fileShowIgnored:false,selectedFiles:new Set(),collapsedGroups:new Set(),
+    document,$:id=>elements[id],state:{},downloadQueue:{items:[],batches:[],stopped:false},fileQuery:'',fileStatus:'all',fileShowIgnored:false,selectedFiles:new Set(),collapsedGroups:new Set(),
     note:()=>{},refresh:async()=>{},api:async()=>({ok:true}),run:async fn=>fn(),
     // activeFiles()/allFiles() call these imported or earlier-defined helpers; the slice omits them.
     isIgnoredFile:file=>file?.ignored===true,
@@ -130,4 +130,33 @@ test('course auto-download choices are independent, survive redraw and are saved
   await elements.saveCourses.onclick();
   assert.deepEqual(Array.from(saved.selected),['a','b']);assert.deepEqual(Array.from(saved.autoDownload),['a']);
   assert.equal(context.courseDraft,null);assert.equal(context.autoDownloadDraft,null);
+});
+
+test('download status chips filter saved/missing files and bulk actions respect the filter and search',async()=>{
+  const {context,elements}=fileView();
+  context.state={integrationMode:'browser',courses:[{id:'c',name:'Course',enabled:true}],files:Object.fromEntries([
+    {key:'saved',name:'saved.pdf',browserDownload:{path:'/saved.pdf'}},
+    {key:'new',name:'new.pdf'},{key:'failed',name:'failed.pdf',error:'network'},
+    {key:'ignored',name:'ignored.pdf',ignored:true}
+  ].map(f=>[f.key,{...f,courseId:'c'}]))};
+  context.downloadQueue.items=[{key:'failed',status:'failed'}];
+  const source=uiSource();
+  vm.runInContext(source.slice(source.indexOf("$('downloadAll').onclick="),source.indexOf('const setIgnored=')),context);
+  context.renderFiles();
+  context.selectedFiles.add('saved');
+  elements.fileSummary.children[2].onclick();
+  assert.equal(elements.fileSummary.children[2]['aria-pressed'],'true');
+  assert.equal(elements.fileSummary.children[2].textContent,'未下载 2','failed files remain available for retry');
+  assert.equal(context.selectedFiles.size,0,'switching filters clears hidden selections');
+  elements.selectVisibleFiles.onclick();
+  assert.deepEqual([...context.selectedFiles].sort(),['failed','new']);
+  assert.equal(elements.downloadAll.textContent,'下载筛选结果');
+  let request;context.api=async msg=>{request=msg;return{queued:msg.keys.length};};
+  await elements.downloadAll.onclick();assert.deepEqual([...request.keys].sort(),['failed','new']);
+  context.fileQuery='failed';context.renderFiles();
+  await elements.downloadAll.onclick();assert.deepEqual([...request.keys],['failed']);
+  context.fileQuery='';elements.fileSummary.children[1].onclick();
+  elements.selectVisibleFiles.onclick();assert.deepEqual([...context.selectedFiles],['saved']);
+  elements.fileSummary.children[0].onclick();elements.selectVisibleFiles.onclick();
+  assert.equal(context.selectedFiles.size,3,'all excludes ignored files');
 });

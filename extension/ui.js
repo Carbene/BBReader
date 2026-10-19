@@ -4,7 +4,7 @@ const $=id=>document.getElementById(id), demo=!globalThis.chrome?.runtime?.id;
 let archiveConfig={courses:{}},platformOS=demo?(new URLSearchParams(location.search).get('platform')||'mac'):null;
 let authBusy=false;
 let state={courses:[],assignments:[],files:{}}, downloadQueue={items:[],batches:[],stopped:false}, directoryMigration=null, month=new Date(), dayFilter=null;
-let filterValue='open',courseFilter='',query='',fileQuery='',courseDraft=null,autoDownloadDraft=null,noteTimer=null;
+let filterValue='open',courseFilter='',query='',fileQuery='',fileStatus='all',courseDraft=null,autoDownloadDraft=null,noteTimer=null;
 const collapsedGroups=new Set();
 const selectedFiles=new Set();
 let fileShowIgnored=false;
@@ -54,6 +54,8 @@ function activeAssignments(){return state.assignments.filter(a=>enabledCourse(a.
 const activeFiles=()=>Object.values(state.files||{}).filter(f=>enabledCourse(f.courseId)&&!isIgnoredFile(f));
 function allFiles(){return Object.values(state.files||{}).filter(f=>enabledCourse(f.courseId));}
 const fileSaved=f=>state.integrationMode==='macos'?f.savedPath:f.browserDownload?.path;
+const matchesFile=f=>(fileStatus==='all'||(fileStatus==='saved'?!!fileSaved(f):!fileSaved(f)))&&`${f.name} ${fileSaved(f)||''}`.toLowerCase().includes(fileQuery.trim().toLowerCase());
+const visibleFiles=()=>activeFiles().filter(matchesFile);
 
 function renderIntegration(){
   const integrated=state.integrationMode==='macos';
@@ -226,10 +228,11 @@ function renderCourses(){
 function renderFiles(){
   const files=activeFiles(),q=fileQuery.trim().toLowerCase();
   const ignoreBusy=!!state.job||downloadQueue.stopping||downloadQueue.items.some(i=>['queued','running'].includes(i.status));
-  const match=f=>!q||`${f.name} ${fileSaved(f)||''}`.toLowerCase().includes(q);
-  const saved=files.filter(fileSaved).length,failed=downloadQueue.items.filter(i=>i.status==='failed'&&files.some(f=>f.key===i.key)).length,queued=downloadQueue.items.filter(i=>['queued','running'].includes(i.status)&&files.some(f=>f.key===i.key)).length,never=files.length-saved-failed-queued;
-  const ignored=allFiles().filter(isIgnoredFile),ignoredVisible=fileShowIgnored?ignored.filter(match):[];
-  $('fileSummary').replaceChildren(...(files.length||ignored.length?[el('span',`共 ${files.length} 份`),el('span',`已保存 ${saved}`,'ok'),el('span',`未下载 ${Math.max(0,never)}`),...(queued?[el('span',`队列 ${queued}`)]:[]),...(failed?[el('span',`失败 ${failed}`,'err')]:[]),...(ignored.length?[el('span',`已忽略 ${ignored.length}`)]:[])]:[]));
+  const match=matchesFile;
+  const saved=files.filter(fileSaved).length,failed=downloadQueue.items.filter(i=>i.status==='failed'&&files.some(f=>f.key===i.key)).length,queued=downloadQueue.items.filter(i=>['queued','running'].includes(i.status)&&files.some(f=>f.key===i.key)).length,never=files.length-saved;
+  const ignored=allFiles().filter(isIgnoredFile),ignoredVisible=fileShowIgnored&&fileStatus==='all'?ignored.filter(match):[];
+  const filterButton=(value,label)=>{const b=el('button',label,'ghost');b.type='button';b.setAttribute('aria-pressed',String(fileStatus===value));b.onclick=()=>{fileStatus=value;selectedFiles.clear();renderFiles();};return b;};
+  $('fileSummary').replaceChildren(...(files.length||ignored.length?[filterButton('all',`共 ${files.length} 份`),filterButton('saved',`已保存 ${saved}`),filterButton('missing',`未下载 ${never}`),...(queued?[el('span',`队列 ${queued}`)]:[]),...(failed?[el('span',`失败 ${failed}`,'err')]:[]),...(ignored.length?[el('span',`已忽略 ${ignored.length}`)]:[])]:[]));
   const visible=files.filter(match);
   // The selection counts both live and ignored files: download/ignore apply to live files, while
   // "取消忽略所选" applies to the ignored ones. Keeping ignored keys out of this list made that
@@ -238,7 +241,7 @@ function renderFiles(){
   const selected=[...selectedFiles].filter(key=>known[key]&&enabledCourse(known[key].courseId));
   const ignoredSel=selected.filter(key=>isIgnoredFile(known[key])).length,activeSel=selected.length-ignoredSel;
   $('downloadSelected').textContent=`下载所选（${activeSel}）`;$('downloadSelected').disabled=!activeSel||!!state.job;
-  $('downloadAll').disabled=!files.length||!!state.job;
+  $('downloadAll').disabled=!visible.length||!!state.job;$('downloadAll').textContent=fileStatus!=='all'||q?'下载筛选结果':'全部下载';
   $('selectVisibleFiles').disabled=!visible.length||!!state.job;$('clearFileSelection').disabled=!selected.length;
   // "忽略所选" stays in the toolbar (disabled without a usable selection) as it always has; it only
   // steps aside when every selected file is already ignored, where it could do nothing.
@@ -265,7 +268,7 @@ function renderFiles(){
     const list=files.filter(f=>f.courseId===c.id&&match(f)).sort((a,b)=>(a.name||'').localeCompare(b.name||'','zh-CN'));
     if(!list.length)continue;
     const group=el('details',undefined,'file-group'),summary=el('summary');group.style.setProperty('--course',courseColor(c.id));
-    group.open=!!q||!collapsedGroups.has(c.id);group.ontoggle=()=>{if(!q)group.open?collapsedGroups.delete(c.id):collapsedGroups.add(c.id);};
+    group.open=!!q||fileStatus!=='all'||!collapsedGroups.has(c.id);group.ontoggle=()=>{if(!q)group.open?collapsedGroups.delete(c.id):collapsedGroups.add(c.id);};
     summary.append(el('span',undefined,'swatch'),c.name,el('small',`${list.filter(fileSaved).length} / ${list.length} 已保存`));group.append(summary);
     for(const f of list)group.append(rowFor(f));
     $('fileList').append(group);
@@ -277,7 +280,7 @@ function renderFiles(){
     for(const f of ignoredVisible.slice().sort((a,b)=>(a.name||'').localeCompare(b.name||'','zh-CN')))group.append(rowFor(f));
     $('fileList').append(group);
   }
-  if(!$('fileList').children.length){const empty=el('div',undefined,'empty');empty.append(el('b',files.length||ignored.length?'没有匹配的文件':'还没有课件'),files.length||ignored.length?'换个关键词试试。':'检查课程后，这里会显示课件与保存位置。');$('fileList').append(empty);}
+  if(!$('fileList').children.length){const empty=el('div',undefined,'empty');empty.append(el('b',files.length||ignored.length?'没有匹配的文件':'还没有课件'),files.length||ignored.length?'试试其他下载状态或关键词。':'检查课程后，这里会显示课件与保存位置。');$('fileList').append(empty);}
 }
 
 function render(){
@@ -324,9 +327,9 @@ const hashView=()=>location.hash.replace(/^#\/?/,'');
 window.addEventListener('hashchange',()=>showView(hashView()));
 document.querySelector('.brand').onclick=e=>{e.preventDefault();showView('agenda');};
 $('sync').onclick=()=>run(async()=>{await api({op:'sync'});note('正在读取 Blackboard，请稍候。');setTimeout(refresh,500);});
-$('downloadAll').onclick=()=>run(async()=>{const r=await api({op:'downloadFiles',keys:activeFiles().map(f=>f.key)});await refresh();note(`已将 ${r.queued} 个课件加入下载队列。`);});
+$('downloadAll').onclick=()=>run(async()=>{const r=await api({op:'downloadFiles',keys:visibleFiles().map(f=>f.key)});await refresh();note(`已将 ${r.queued} 个课件加入下载队列。`);});
 $('downloadSelected').onclick=()=>run(async()=>{const known=state.files||{};const keys=[...selectedFiles].filter(key=>known[key]&&!isIgnoredFile(known[key]));const r=await api({op:'downloadFiles',keys});selectedFiles.clear();await refresh();note(`已将 ${r.queued} 个课件加入下载队列。`);});
-$('selectVisibleFiles').onclick=()=>{const q=fileQuery.trim().toLowerCase();for(const f of activeFiles())if(!q||`${f.name} ${fileSaved(f)||''}`.toLowerCase().includes(q))selectedFiles.add(f.key);renderFiles();};
+$('selectVisibleFiles').onclick=()=>{for(const f of visibleFiles())selectedFiles.add(f.key);renderFiles();};
 $('clearFileSelection').onclick=()=>{selectedFiles.clear();renderFiles();};
 const setIgnored=ignored=>run(async()=>{
   // Send only the keys the action applies to: ignoring a file that is already ignored was a no-op
@@ -348,7 +351,7 @@ document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filterValue
 document.querySelectorAll('[data-metric]').forEach(b=>b.onclick=()=>{if(b.dataset.metric==='courses')return showView('courses');filterValue='open';dayFilter=null;courseFilter='';query='';$('search').value='';renderAgenda();});
 $('courseFilter').onchange=()=>{courseFilter=$('courseFilter').value;renderAgenda();};
 $('search').oninput=()=>{query=$('search').value;renderAgenda();};
-$('fileSearch').oninput=()=>{fileQuery=$('fileSearch').value;renderFiles();};
+$('fileSearch').oninput=()=>{fileQuery=$('fileSearch').value;selectedFiles.clear();renderFiles();};
 $('prevMonth').onclick=()=>{month=new Date(month.getFullYear(),month.getMonth()-1,1);renderMonth(activeAssignments());};
 $('nextMonth').onclick=()=>{month=new Date(month.getFullYear(),month.getMonth()+1,1);renderMonth(activeAssignments());};
 $('todayMonth').onclick=()=>{const [y,m]=campusDay().split('-').map(Number);month=new Date(y,m-1,1);renderMonth(activeAssignments());};
