@@ -1,17 +1,19 @@
 import {CAS_PERMISSION} from './auth.js';
-import {makeICS,campusDay,ORIGIN,DAY} from './core.js';
+import {makeICS,campusDay,ORIGIN,DAY,isIgnoredFile} from './core.js';
 const $=id=>document.getElementById(id), demo=!globalThis.chrome?.runtime?.id;
 let archiveConfig={courses:{}},platformOS=demo?(new URLSearchParams(location.search).get('platform')||'mac'):null;
 let authBusy=false;
-let state={courses:[],assignments:[],files:{}}, month=new Date(), dayFilter=null;
-let filterValue='open',courseFilter='',query='',fileQuery='',courseDraft=null,noteTimer=null;
+let state={courses:[],assignments:[],files:{}}, downloadQueue={items:[],batches:[],stopped:false}, directoryMigration=null, month=new Date(), dayFilter=null;
+let filterValue='open',courseFilter='',query='',fileQuery='',fileStatus='all',courseDraft=null,autoDownloadDraft=null,noteTimer=null;
 const collapsedGroups=new Set();
+const selectedFiles=new Set();
+let fileShowIgnored=false;
 {const [y,m]=campusDay().split('-').map(Number);month=new Date(y,m-1,1);}
 const labels={unknown:'提交状态待核对',submitted:'已提交',graded:'已评阅'};
 const VIEWS={
-  agenda:['作业日程','截止日期一目了然，课件自动归位。'],
+  agenda:['作业日程','作业按期整理，课件按需归档。'],
   courses:['我的课程','当前学期的全部已注册课程，包括 Blackboard 首页隐藏的课程。'],
-  files:['课件归档','课件自动保存到本地，按学期、课程与内容目录整理。'],
+  files:['课件归档','先查看课件列表，再下载全部或指定文件。'],
   settings:['连接与设置','运行模式、学校登录、日历订阅与同步记录。']
 };
 const PALETTE=['#2f7d6d','#3a6fbf','#b85a2c','#7a56b8','#a8456f','#2b8196','#8a6d17','#4f7f2a'];
@@ -27,7 +29,7 @@ const previewState=(()=>{
   const a=(id,c,title,due,status,extra={})=>({id,courseId:c.id,courseName:c.name,title,due,status,url:ORIGIN,checked:Date.now(),...extra});
   const [c1,c2,c3]=courses;
   const files={};
-  [['Lecture 01 · Introduction.pdf',c1,'浏览器下载目录/BBReader/2026 秋/编译原理/Lectures/Lecture 01 · Introduction.pdf'],['Lecture 02 · Lexing.pptx',c1,'浏览器下载目录/BBReader/2026 秋/编译原理/Lectures/Lecture 02 · Lexing.pptx'],['Lab 1 handout.pdf',c2,'浏览器下载目录/BBReader/2026 秋/计算机网络/Labs/Lab 1 handout.pdf'],['starter-code.zip',c2,null],['Syllabus.pdf',c3,'浏览器下载目录/BBReader/2026 秋/深度学习/Syllabus.pdf']].forEach(([name,c,path],i)=>{files[`${c.id}:${i}`]={key:`${c.id}:${i}`,courseId:c.id,name,url:ORIGIN,browserDownload:path?{path}:undefined,error:i===3?'附件返回登录页或错误页面':null};});
+  [['Lecture 01 · Introduction.pdf',c1,'浏览器下载目录/BBReader/2026 秋/编译原理/Lectures/Lecture 01 · Introduction.pdf'],['Lecture 02 · Lexing.pptx',c1,'浏览器下载目录/BBReader/2026 秋/编译原理/Lectures/Lecture 02 · Lexing.pptx'],['Lab 1 handout.pdf',c2,'浏览器下载目录/BBReader/2026 秋/计算机网络/Labs/Lab 1 handout.pdf'],['starter-code.zip',c2,null],['Syllabus.pdf',c3,'浏览器下载目录/BBReader/2026 秋/深度学习/Syllabus.pdf']].forEach(([name,c,path],i)=>{files[`${c.id}:${i}`]={key:`${c.id}:${i}`,courseId:c.id,name,url:ORIGIN,browserDownload:path?{path}:undefined,error:i===3?'附件返回登录页或错误页面':null,ignored:i===4||undefined};});
   return {status:'课程和作业检查完成',lastSync:Date.now()-2*3600000,lastRun:Date.now()-2*3600000,account:'preview',accountLabel:'示例账户',enabled:true,integrationMode:'browser',currentTerm:{name:'2026 秋（示例）'},downloadStatus:'文件检查完成',warnings:['示例课程 · 计算机网络: starter-code.zip 下载失败'],files,courses,assignments:[
     a('_a1',c1,'Assignment 1 · Lexical Analysis',at(0,23,59),'unknown'),
     a('_a2',c2,'Lab 2 · Wireshark 抓包',at(1,16,0),'unknown'),
@@ -38,19 +40,22 @@ const previewState=(()=>{
     a('_a7',c2,'Project Proposal',null,'unknown')]};
 })();
 
-async function api(msg){if(demo){if(msg.op==='state')return{state:previewState,nextCheck:Date.parse(`${campusDay(Date.now()+DAY)}T09:00:00+08:00`)};throw new Error('这是界面预览，请在 Chrome 插件中操作');}const r=await chrome.runtime.sendMessage(msg);if(!r?.ok)throw new Error(r?.error||'未收到响应');return r;}
+async function api(msg){if(demo){if(msg.op==='state')return{state:previewState,downloadQueue,nextCheck:Date.parse(`${campusDay(Date.now()+DAY)}T09:00:00+08:00`)};throw new Error('这是界面预览，请在 Chrome 插件中操作');}const r=await chrome.runtime.sendMessage(msg);if(!r?.ok)throw new Error(r?.error||'未收到响应');return r;}
 function el(tag,txt,cls){const e=document.createElement(tag);if(txt!==undefined&&txt!==null)e.textContent=txt;if(cls)e.className=cls;return e;}
 function note(text){
   clearTimeout(noteTimer);$('message').textContent=text||'';$('message').hidden=!text;
   if(text)noteTimer=setTimeout(()=>{$('message').hidden=true;},7000);
 }
 function link(title,url){const a=el('a',title);if(/^https:\/\//.test(url||'')){a.href=url;a.target='_blank';a.rel='noreferrer';}return a;}
-async function refresh(){try{const response=await api({op:'state'}),previous=state.integrationMode;state=response.state;platformOS=response.platform||platformOS;if(state.integrationMode==='macos'&&previous!=='macos'){try{archiveConfig=await api({op:'nativeStatus'});}catch(e){archiveConfig={courses:{},error:e.message};}}render();$('nextCheck').textContent=state.enabled!==false&&response.nextCheck?`下次自动检查：${format(response.nextCheck)}（UTC+8）`:'';}catch(e){note(e.message);}}
+async function refresh(){try{const response=await api({op:'state'}),previous=state.integrationMode;state=response.state;downloadQueue=response.downloadQueue||downloadQueue;directoryMigration=response.directoryMigration||null;platformOS=response.platform||platformOS;for(const key of selectedFiles)if(!state.files[key]||!enabledCourse(state.files[key].courseId))selectedFiles.delete(key);if(state.integrationMode==='macos'&&previous!=='macos'){try{archiveConfig=await api({op:'nativeStatus'});}catch(e){archiveConfig={courses:{},error:e.message};}}render();$('nextCheck').textContent=state.enabled!==false&&response.nextCheck?`下次自动检查：${format(response.nextCheck)}（UTC+8）`:'';}catch(e){note(e.message);}}
 const isDone=a=>state.integrationMode==='macos'?a.reminderCompleted===true||['submitted','graded'].includes(a.status):a.localCompleted??['submitted','graded'].includes(a.status);
 const enabledCourse=id=>state.courses.some(c=>c.id===id&&c.enabled);
 function activeAssignments(){return state.assignments.filter(a=>enabledCourse(a.courseId));}
-const activeFiles=()=>Object.values(state.files||{}).filter(f=>enabledCourse(f.courseId));
+const activeFiles=()=>Object.values(state.files||{}).filter(f=>enabledCourse(f.courseId)&&!isIgnoredFile(f));
+function allFiles(){return Object.values(state.files||{}).filter(f=>enabledCourse(f.courseId));}
 const fileSaved=f=>state.integrationMode==='macos'?f.savedPath:f.browserDownload?.path;
+const matchesFile=f=>(fileStatus==='all'||(fileStatus==='saved'?!!fileSaved(f):!fileSaved(f)))&&`${f.name} ${fileSaved(f)||''}`.toLowerCase().includes(fileQuery.trim().toLowerCase());
+const visibleFiles=()=>activeFiles().filter(matchesFile);
 
 function renderIntegration(){
   const integrated=state.integrationMode==='macos';
@@ -58,10 +63,11 @@ function renderIntegration(){
   document.querySelectorAll('[data-integrated]').forEach(e=>e.hidden=!integrated);
   $('modeBadge').textContent=integrated?'macOS 系统集成':'浏览器独立模式';
   $('modeBadge').dataset.state=integrated?'enabled':'browser';
-  $('modeDescription').textContent=integrated?'使用本地助手归档课件，可连接钥匙串与 Apple 提醒事项。':'无需安装本地助手，课件直接保存到浏览器下载目录。';
+  $('modeDescription').textContent=state.integrationError||(integrated?'使用本地助手归档课件，可连接钥匙串与 Apple 提醒事项。':'无需安装本地助手，课件直接保存到浏览器下载目录。');
   $('toggleIntegration').textContent=integrated?'切换为浏览器独立模式':'启用 macOS 系统集成';
   $('browserDownloadHint').hidden=integrated;
   $('helper').textContent=integrated?(archiveConfig.error|| (archiveConfig.root?`归档根目录：${archiveConfig.root}`:'本地助手已连接，请选择保存文件夹。')):'浏览器下载目录 / BBReader / 学期 / 课程 / 内容目录';
+  $('retryMigration').hidden=!directoryMigration?.files?.some(f=>f.status==='failed');
 }
 
 function renderStatus(){
@@ -70,6 +76,11 @@ function renderStatus(){
   $('statusDot').dataset.state=busy?'busy':state.lastError||state.warnings?.length?'warn':state.account?'ok':'idle';
   $('lastSync').textContent=state.lastSync?`上次检查 ${format(state.lastSync)}`:'首次使用：点击「立即检查」连接课程';
   $('sync').disabled=busy;$('sync').classList.toggle('busy',busy);$('sync').querySelector('.label').textContent=busy?'检查中…':'立即检查';
+  const active=downloadQueue.items.filter(i=>['queued','running'].includes(i.status));
+  const resumable=[...(downloadQueue.batches||[])].reverse().find(b=>downloadQueue.items.some(i=>i.batchId===b.id&&i.status==='cancelled'));
+  $('stopDownloads').hidden=false;$('stopDownloads').textContent=downloadQueue.stopping?'正在暂停…':'暂停下载';$('stopDownloads').disabled=!active.length||!!downloadQueue.stopping||(busy&& !downloadQueue.items.some(i=>i.status==='running'));
+  $('resumeDownloads').hidden=!resumable;$('resumeDownloads').textContent=resumable?`恢复下载（${downloadQueue.items.filter(i=>i.batchId===resumable.id&&i.status==='cancelled').length}）`:'恢复下载';$('resumeDownloads').dataset.batchId=resumable?.id||'';
+  $('cancelDownloads').hidden=!resumable;$('cancelDownloads').disabled=!resumable||!!downloadQueue.stopping||busy;$('cancelDownloads').dataset.batchId=resumable?.id||'';
   $('progress').hidden=!busy;
   if(busy){const total=state.job.done+(state.job.queue?.length||0),bar=$('progress').firstElementChild;
     $('progress').classList.toggle('indeterminate',!total);bar.style.width=total?`${Math.max(4,Math.round(state.job.done/total*100))}%`:'';}
@@ -159,12 +170,43 @@ function renderMonth(all){const y=month.getFullYear(),m=month.getMonth();$('mont
 
 function updateCourseBar(){
   const boxes=[...document.querySelectorAll('[data-course]')],checked=boxes.filter(b=>b.checked);
-  const dirty=boxes.some(b=>b.checked!==!!state.courses.find(c=>c.id===b.dataset.course)?.enabled);
+  const autoBoxes=[...document.querySelectorAll('[data-auto-download]')];
+  const dirty=boxes.some(b=>b.checked!==!!state.courses.find(c=>c.id===b.dataset.course)?.enabled)||autoBoxes.some(b=>b.checked!==!!state.courses.find(c=>c.id===b.dataset.autoDownload)?.autoDownload);
   courseDraft=dirty?new Set(checked.map(b=>b.dataset.course)):null;
+  autoDownloadDraft=dirty?new Set(autoBoxes.filter(b=>b.checked).map(b=>b.dataset.autoDownload)):null;
+  autoBoxes.forEach(b=>b.disabled=!checked.some(c=>c.dataset.course===b.dataset.autoDownload));
   boxes.forEach(b=>b.closest('.course').classList.toggle('off',!b.checked));
   $('courseSelection').textContent=boxes.length?`已选择 ${checked.length} / ${boxes.length} 门课程${dirty?' · 有未保存的更改':''}`:'';
   $('courseSaveBar').classList.toggle('dirty',dirty);$('courseSaveBar').hidden=!boxes.length;
   $('saveCourses').disabled=!dirty;
+}
+function askDirectoryMigration(plan){
+  const dlg=$('directoryMigrationDialog');$('directoryMigrationText').textContent=`将保存目录改为“${plan.path}”。发现 ${plan.files.length} 个已有课件。迁移会在本机进行并校验文件，不会重新下载；选择不迁移时，已有课件保留原位置。`;
+  return new Promise(resolve=>{dlg.onclose=()=>resolve(dlg.returnValue||'cancel');dlg.showModal();});
+}
+function askCancelDownloads(count){
+  const dlg=$('cancelDownloadsDialog');
+  $('cancelDownloadsText').textContent=`将取消这批下载：${count} 个尚未完成的课件会移出下载队列，正在进行的下载会被撤销，暂存文件会被清理。已下载完成的文件，以及之后重新发起的下载都不受影响。`;
+  return new Promise(resolve=>{dlg.onclose=()=>resolve(dlg.returnValue||'keep');dlg.showModal();});
+}
+async function cancelBatch(batchId){
+  const items=(downloadQueue.items||[]).filter(i=>i.batchId===batchId&&i.status!=='complete');
+  if(!items.length){note('这批下载已没有可取消的内容。');await refresh();return;}
+  if(await askCancelDownloads(items.length)!=='cancel')return;
+  const r=await api({op:'cancelDownloads',batchId});
+  await refresh();
+  note(`已取消 ${r.cancelled} 个未完成的下载${r.revoked?`，其中 ${r.revoked} 个已暂停的下载已作废`:''}。`);
+}
+async function changeDirectory(op,courseId){
+  const r=await api({op,...(courseId?{courseId}:{})});if(r.cancelled)return;
+  if(!r.prepared){helper(r);return;}
+  const plan=r.plan;let choice='keep';
+  if(plan.files.length)choice=await askDirectoryMigration(plan);
+  if(choice==='cancel'){await api({op:'cancelDirectoryChange',planId:plan.id});note('已取消切换，原目录和文件未改变。');return;}
+  const result=await api({op:'commitDirectoryChange',planId:plan.id,migrate:choice==='migrate'});
+  archiveConfig=await api({op:'nativeStatus'});await refresh();renderCourses();
+  if(choice==='migrate')note(`保存目录已更新：迁移 ${result.migrated} 个文件${result.failed?`，${result.failed} 个未迁移成功，可核对后重试`:''}。`);
+  else note('保存目录已更新；已有文件留在原位置，之后手动下载的文件将保存到新目录。');
 }
 function renderCourses(){
   $('courseList').replaceChildren();
@@ -174,8 +216,10 @@ function renderCourses(){
     input.type='checkbox';input.checked=courseDraft?courseDraft.has(c.id):c.enabled;input.dataset.course=c.id;input.onchange=updateCourseBar;
     body.append(el('strong',c.name),el('small',[c.code,c.term].filter(Boolean).join(' · ')));
     const directory=el('small',state.integrationMode==='macos'?(archiveConfig.courses?.[c.id]||'使用默认根目录'):`下载目录 / BBReader / ${c.term} / ${c.name}`);directory.dataset.coursePath=c.id;body.append(directory);
-    const choose=el('button','选择保存文件夹…');choose.type='button';choose.onclick=()=>run(async()=>{choose.disabled=true;try{note('请在 macOS 窗口中选择保存文件夹。');const r=await api({op:'chooseCourse',courseId:c.id});if(r.cancelled){note('已取消，保存目录未更改。');return;}helper(r);note('课程保存文件夹已更新。');}finally{choose.disabled=false;}});choose.hidden=state.integrationMode!=='macos';
-    body.append(choose);label.append(input,swatch,body);row.append(label);$('courseList').append(row);
+    const choose=el('button','选择保存文件夹…');choose.type='button';choose.onclick=()=>run(async()=>{choose.disabled=true;try{note('请在 macOS 窗口中选择保存文件夹。');await changeDirectory('chooseCourse',c.id);}finally{choose.disabled=false;}});choose.hidden=state.integrationMode!=='macos';
+    body.append(choose);label.append(input,swatch,body);row.append(label);
+    const autoLabel=el('label',undefined,'course-download'),auto=el('input');auto.type='checkbox';auto.dataset.autoDownload=c.id;auto.checked=autoDownloadDraft?autoDownloadDraft.has(c.id):c.autoDownload===true;auto.setAttribute('aria-label',`${c.name}：自动下载课件`);auto.onchange=updateCourseBar;
+    autoLabel.append(auto,el('span','自动下载课件'));row.append(autoLabel);$('courseList').append(row);
   }
   if(!state.courses.length){const empty=el('div',undefined,'empty');empty.style.gridColumn='1/-1';empty.append(el('b','尚未发现课程'),'先点击「立即检查」读取当前学期的课程。');$('courseList').append(empty);}
   updateCourseBar();
@@ -183,25 +227,60 @@ function renderCourses(){
 
 function renderFiles(){
   const files=activeFiles(),q=fileQuery.trim().toLowerCase();
-  const saved=files.filter(fileSaved).length,failed=files.filter(f=>f.error).length,waiting=files.length-saved-failed;
-  $('fileSummary').replaceChildren(...(files.length?[el('span',`共 ${files.length} 份`),el('span',`已保存 ${saved}`,'ok'),...(waiting>0?[el('span',`等待 ${waiting}`)]:[]),...(failed?[el('span',`失败 ${failed}`,'err')]:[])]:[]));
+  const ignoreBusy=!!state.job||downloadQueue.stopping||downloadQueue.items.some(i=>['queued','running'].includes(i.status));
+  const match=matchesFile;
+  const saved=files.filter(fileSaved).length,failed=downloadQueue.items.filter(i=>i.status==='failed'&&files.some(f=>f.key===i.key)).length,queued=downloadQueue.items.filter(i=>['queued','running'].includes(i.status)&&files.some(f=>f.key===i.key)).length,never=files.length-saved;
+  const ignored=allFiles().filter(isIgnoredFile),ignoredVisible=fileShowIgnored&&fileStatus==='all'?ignored.filter(match):[];
+  const filterButton=(value,label)=>{const b=el('button',label,'ghost');b.type='button';b.setAttribute('aria-pressed',String(fileStatus===value));b.onclick=()=>{fileStatus=value;selectedFiles.clear();renderFiles();};return b;};
+  $('fileSummary').replaceChildren(...(files.length||ignored.length?[filterButton('all',`共 ${files.length} 份`),filterButton('saved',`已保存 ${saved}`),filterButton('missing',`未下载 ${never}`),...(queued?[el('span',`队列 ${queued}`)]:[]),...(failed?[el('span',`失败 ${failed}`,'err')]:[]),...(ignored.length?[el('span',`已忽略 ${ignored.length}`)]:[])]:[]));
+  const visible=files.filter(match);
+  // The selection counts both live and ignored files: download/ignore apply to live files, while
+  // "取消忽略所选" applies to the ignored ones. Keeping ignored keys out of this list made that
+  // count always zero, so the un-ignore action could never appear.
+  const known=state.files||{};
+  const selected=[...selectedFiles].filter(key=>known[key]&&enabledCourse(known[key].courseId));
+  const ignoredSel=selected.filter(key=>isIgnoredFile(known[key])).length,activeSel=selected.length-ignoredSel;
+  $('downloadSelected').textContent=`下载所选（${activeSel}）`;$('downloadSelected').disabled=!activeSel||!!state.job;
+  $('downloadAll').disabled=!visible.length||!!state.job;$('downloadAll').textContent=fileStatus!=='all'||q?'下载筛选结果':'全部下载';
+  $('selectVisibleFiles').disabled=!visible.length||!!state.job;$('clearFileSelection').disabled=!selected.length;
+  // "忽略所选" stays in the toolbar (disabled without a usable selection) as it always has; it only
+  // steps aside when every selected file is already ignored, where it could do nothing.
+  $('ignoreSelected').hidden=Boolean(selected.length)&&!activeSel;
+  $('ignoreSelected').disabled=!activeSel||ignoreBusy;$('ignoreSelected').textContent=activeSel?`忽略所选（${activeSel}）`:'忽略所选';
+  $('unignoreSelected').hidden=!ignoredSel;$('unignoreSelected').disabled=!ignoredSel||ignoreBusy;$('unignoreSelected').textContent=`取消忽略所选（${ignoredSel}）`;
+  $('toggleIgnoredFiles').hidden=!ignored.length;$('toggleIgnoredFiles').textContent=fileShowIgnored?`隐藏已忽略（${ignored.length}）`:`显示已忽略（${ignored.length}）`;$('toggleIgnoredFiles').setAttribute('aria-pressed',String(fileShowIgnored));
+  const pendingCount=downloadQueue.items.filter(i=>i.status==='cancelled').length;
+  const active=downloadQueue.items.some(i=>['queued','running'].includes(i.status));
+  $('downloadStatus').textContent=active?'正在处理下载队列。':pendingCount?`下载已暂停：还有 ${pendingCount} 个未完成的课件；可以“恢复下载”，或用“取消下载”把它们移出队列。`:state.downloadStatus||'检查更新索引；仅自动下载已开启课程的课件，也可手动选择下载。';
+  const rowFor=f=>{
+    const path=fileSaved(f),ignored=isIgnoredFile(f),row=el('div',undefined,ignored?'file ignored':'file'),body=el('div');
+    const box=el('input');box.type='checkbox';box.className='select-file';box.checked=selectedFiles.has(f.key);box.setAttribute('aria-label',`选择 ${f.name}`);box.onchange=()=>{box.checked?selectedFiles.add(f.key):selectedFiles.delete(f.key);renderFiles();};row.append(box);
+    const item=[...downloadQueue.items].reverse().find(i=>i.key===f.key),status=ignored?'已忽略':path?'已保存':item?.status==='running'?'下载中':item?.status==='queued'?'排队中':item?.status==='cancelled'?'下载已暂停':item?.status==='failed'?'下载失败':'未下载';
+    row.append(el('span',undefined,'state'+(f.error?' err':path?' ok':ignored?' ignored':'')));
+    body.append(el('strong',f.name),el('small',f.error||path||status,f.error?'err':ignored?'ignored':''));
+    const toggle=el('button',ignored?'取消忽略':'忽略','ghost file-action');toggle.type='button';toggle.disabled=ignoreBusy;toggle.onclick=()=>run(async()=>{await api({op:'ignoreFiles',keys:[f.key],ignored:!ignored});await refresh();note(ignored?`已取消忽略：${f.name}`:`已忽略：${f.name}`);});
+    const action=el('button',path?'重新下载':'下载','ghost file-action');action.type='button';action.disabled=!!state.job||ignored||item?.status==='queued'||item?.status==='running';action.onclick=()=>run(async()=>{await api({op:'downloadFiles',keys:[f.key]});await refresh();});
+    row.append(body,toggle,action,link('原文件 ↗',f.url));
+    return row;
+  };
   $('fileList').replaceChildren();
   for(const c of state.courses.filter(c=>c.enabled)){
-    const list=files.filter(f=>f.courseId===c.id&&(!q||`${f.name} ${fileSaved(f)||''}`.toLowerCase().includes(q))).sort((a,b)=>(a.name||'').localeCompare(b.name||'','zh-CN'));
+    const list=files.filter(f=>f.courseId===c.id&&match(f)).sort((a,b)=>(a.name||'').localeCompare(b.name||'','zh-CN'));
     if(!list.length)continue;
     const group=el('details',undefined,'file-group'),summary=el('summary');group.style.setProperty('--course',courseColor(c.id));
-    group.open=!!q||!collapsedGroups.has(c.id);group.ontoggle=()=>{if(!q)group.open?collapsedGroups.delete(c.id):collapsedGroups.add(c.id);};
+    group.open=!!q||fileStatus!=='all'||!collapsedGroups.has(c.id);group.ontoggle=()=>{if(!q)group.open?collapsedGroups.delete(c.id):collapsedGroups.add(c.id);};
     summary.append(el('span',undefined,'swatch'),c.name,el('small',`${list.filter(fileSaved).length} / ${list.length} 已保存`));group.append(summary);
-    for(const f of list){
-      const row=el('div',undefined,'file'),body=el('div'),path=fileSaved(f);
-      row.append(el('span',undefined,'state'+(f.error?' err':path?' ok':'')));
-      body.append(el('strong',f.name),el('small',f.error||path||'等待保存',f.error?'err':''));
-      row.append(body,link('原文件 ↗',f.url));group.append(row);
-    }
+    for(const f of list)group.append(rowFor(f));
     $('fileList').append(group);
   }
-  if(!$('fileList').children.length){const empty=el('div',undefined,'empty');empty.append(el('b',files.length?'没有匹配的文件':'还没有课件'),files.length?'换个关键词试试。':'检查课程后，这里会显示课件与保存位置。');$('fileList').append(empty);}
-  $('downloadStatus').textContent=state.downloadStatus||'检查课程后，课件会自动保存到本地。';
+  if(ignoredVisible.length){
+    const group=el('details',undefined,'file-group ignored-group');group.open=true;
+    group.append(el('summary'));
+    group.firstElementChild.append('已忽略的课件',el('small',`${ignoredVisible.length} 份 · 不计入下载`));
+    for(const f of ignoredVisible.slice().sort((a,b)=>(a.name||'').localeCompare(b.name||'','zh-CN')))group.append(rowFor(f));
+    $('fileList').append(group);
+  }
+  if(!$('fileList').children.length){const empty=el('div',undefined,'empty');empty.append(el('b',files.length||ignored.length?'没有匹配的文件':'还没有课件'),files.length||ignored.length?'试试其他下载状态或关键词。':'检查课程后，这里会显示课件与保存位置。');$('fileList').append(empty);}
 }
 
 function render(){
@@ -212,7 +291,7 @@ function render(){
   // Keychain on macOS integration; otherwise the encrypted browser vault (see vault.js).
   const keychain=state.integrationMode==='macos',saved=keychain?state.credentialLogin===true:state.browserCredentialLogin===true;
   $('authStatus').textContent=state.authStatus||(saved?'已保存账号：登录过期时自动登录，每日最多尝试一次。':'复用当前浏览器的学校登录状态；也可保存账号，登录过期时自动登录。');
-  $('authBadge').textContent=saved&&state.authBlocked?'需要重新连接':saved?'自动登录已开启':'浏览器登录';
+  $('authBadge').textContent=saved&&state.authBlocked?'密码自动重试已暂停':saved?'自动登录已开启':'浏览器登录';
   $('authBadge').dataset.state=saved&&state.authBlocked?'paused':saved?'enabled':'browser';
   $('credentialNote').textContent=keychain?'密码保存在本机钥匙串，仅用于学校统一认证。':'密码经加密保存在当前 Chrome 配置中，仅用于学校统一认证；安全性低于系统钥匙串。';
   $('keychainHint').hidden=keychain||platformOS!=='mac';
@@ -248,18 +327,38 @@ const hashView=()=>location.hash.replace(/^#\/?/,'');
 window.addEventListener('hashchange',()=>showView(hashView()));
 document.querySelector('.brand').onclick=e=>{e.preventDefault();showView('agenda');};
 $('sync').onclick=()=>run(async()=>{await api({op:'sync'});note('正在读取 Blackboard，请稍候。');setTimeout(refresh,500);});
+$('downloadAll').onclick=()=>run(async()=>{const r=await api({op:'downloadFiles',keys:visibleFiles().map(f=>f.key)});await refresh();note(`已将 ${r.queued} 个课件加入下载队列。`);});
+$('downloadSelected').onclick=()=>run(async()=>{const known=state.files||{};const keys=[...selectedFiles].filter(key=>known[key]&&!isIgnoredFile(known[key]));const r=await api({op:'downloadFiles',keys});selectedFiles.clear();await refresh();note(`已将 ${r.queued} 个课件加入下载队列。`);});
+$('selectVisibleFiles').onclick=()=>{for(const f of visibleFiles())selectedFiles.add(f.key);renderFiles();};
+$('clearFileSelection').onclick=()=>{selectedFiles.clear();renderFiles();};
+const setIgnored=ignored=>run(async()=>{
+  // Send only the keys the action applies to: ignoring a file that is already ignored was a no-op
+  // that inflated the reported count, and un-ignoring a live file is rejected by the worker.
+  const known=state.files||{};
+  const keys=[...selectedFiles].filter(key=>known[key]&&isIgnoredFile(known[key])!==ignored);
+  if(!keys.length)throw new Error(ignored?'请先选择要忽略的课件':'请先选择要取消忽略的课件');
+  const r=await api({op:'ignoreFiles',keys,ignored});
+  selectedFiles.clear();await refresh();
+  note(ignored?`已忽略 ${r.count} 个课件，之后不会再进入下载。`:`已取消忽略 ${r.count} 个课件，已恢复到列表。`);
+});
+$('ignoreSelected').onclick=()=>setIgnored(true);
+$('unignoreSelected').onclick=()=>setIgnored(false);
+$('toggleIgnoredFiles').onclick=()=>{fileShowIgnored=!fileShowIgnored;renderFiles();};
+$('stopDownloads').onclick=()=>run(async()=>{const result=await api({op:'stopDownloads'});await refresh();note(result.stopping?'正在暂停下载，完成后会停止后续任务。':'已暂停下载；课程检查仍会继续。');});
+$('resumeDownloads').onclick=()=>run(async()=>{await api({op:'resumeDownloads',batchId:$('resumeDownloads').dataset.batchId});await refresh();note('正在恢复此批次暂停的课件。');});
+$('cancelDownloads').onclick=()=>run(async()=>{const button=$('cancelDownloads');button.disabled=true;try{await cancelBatch(button.dataset.batchId);}finally{button.disabled=false;}});
 document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filterValue=b.dataset.filter;renderAgenda();});
 document.querySelectorAll('[data-metric]').forEach(b=>b.onclick=()=>{if(b.dataset.metric==='courses')return showView('courses');filterValue='open';dayFilter=null;courseFilter='';query='';$('search').value='';renderAgenda();});
 $('courseFilter').onchange=()=>{courseFilter=$('courseFilter').value;renderAgenda();};
 $('search').oninput=()=>{query=$('search').value;renderAgenda();};
-$('fileSearch').oninput=()=>{fileQuery=$('fileSearch').value;renderFiles();};
+$('fileSearch').oninput=()=>{fileQuery=$('fileSearch').value;selectedFiles.clear();renderFiles();};
 $('prevMonth').onclick=()=>{month=new Date(month.getFullYear(),month.getMonth()-1,1);renderMonth(activeAssignments());};
 $('nextMonth').onclick=()=>{month=new Date(month.getFullYear(),month.getMonth()+1,1);renderMonth(activeAssignments());};
 $('todayMonth').onclick=()=>{const [y,m]=campusDay().split('-').map(Number);month=new Date(y,m-1,1);renderMonth(activeAssignments());};
 $('clearDay').onclick=()=>{dayFilter=null;renderAgenda();};
 $('selectAll').onclick=()=>{document.querySelectorAll('[data-course]').forEach(b=>b.checked=true);updateCourseBar();};
 $('selectNone').onclick=()=>{document.querySelectorAll('[data-course]').forEach(b=>b.checked=false);updateCourseBar();};
-$('saveCourses').onclick=()=>run(async()=>{await api({op:'settings',enabled:state.enabled!==false,selected:[...document.querySelectorAll('[data-course]:checked')].map(x=>x.dataset.course)});courseDraft=null;await refresh();note('课程选择已保存，下次检查生效。');});
+$('saveCourses').onclick=()=>run(async()=>{await api({op:'settings',enabled:state.enabled!==false,selected:[...document.querySelectorAll('[data-course]:checked')].map(x=>x.dataset.course),autoDownload:[...document.querySelectorAll('[data-auto-download]:checked')].map(x=>x.dataset.autoDownload)});courseDraft=null;autoDownloadDraft=null;await refresh();note('课程选择已保存，下次检查生效。');});
 $('auto').onchange=()=>{$('checkTime').disabled=!$('auto').checked;};
 $('saveSchedule').onclick=()=>run(async()=>{const time=$('checkTime').value;if(!/^\d{2}:\d{2}$/.test(time))throw new Error('请填写检查时间');await api({op:'settings',enabled:$('auto').checked,checkTime:time,selected:state.courses.filter(c=>c.enabled).map(c=>c.id)});await refresh();note($('auto').checked?`已保存：每天 ${time}（UTC+8）自动检查${state.remindersEnabled?'，完成后同步提醒事项':''}。`:'已关闭每日自动检查。');});
 function helper(r){archiveConfig=r;renderIntegration();document.querySelectorAll('[data-course-path]').forEach(e=>e.textContent=r.courses?.[e.dataset.coursePath]||'使用默认根目录');}
@@ -267,11 +366,11 @@ $('toggleIntegration').onclick=()=>run(async()=>{
   const mode=state.integrationMode==='macos'?'browser':'macos';
   if(mode==='macos'&&!demo&&!(await chrome.permissions.request({permissions:['nativeMessaging']})))throw new Error('未允许连接本地助手');
   $('toggleIntegration').disabled=true;
-  try{await api({op:'integration',mode});await refresh();renderCourses();note('运行模式已更新，现有文件与系统配置均保留。');}finally{$('toggleIntegration').disabled=false;}
+  try{const result=await api({op:'integration',mode});if(result.reloadRequired){note('正在重新加载扩展以应用本地助手权限…');chrome.runtime.reload();return;}await refresh();renderCourses();note('运行模式已更新，现有文件与系统配置均保留。');}finally{$('toggleIntegration').disabled=false;}
 });
-$('chooseRoot').onclick=()=>run(async()=>{$('chooseRoot').disabled=true;try{note('请在 macOS 窗口中选择保存文件夹。');const r=await api({op:'chooseRoot'});if(r.cancelled){note('已取消，保存目录未更改。');return;}helper(r);note('保存文件夹已更新。');await api({op:'files'});}finally{$('chooseRoot').disabled=false;}});
+$('chooseRoot').onclick=()=>run(async()=>{$('chooseRoot').disabled=true;try{note('请在 macOS 窗口中选择保存文件夹。');await changeDirectory('chooseRoot');}finally{$('chooseRoot').disabled=false;}});
+$('retryMigration').onclick=()=>run(async()=>{const r=await api({op:'retryMigration'});await refresh();note(`迁移重试完成：迁移 ${r.migrated} 个文件${r.failed?`，仍有 ${r.failed} 个失败`:''}。`);});
 $('checkHelper').onclick=()=>run(async()=>helper(await api({op:'nativeStatus'})));
-$('retryFiles').onclick=()=>run(async()=>{await api({op:'files'});note('已开始检查尚未归档的文件。');});
 for(const op of ['connectReminders','syncReminders','pauseReminders'])$(op).onclick=()=>run(async()=>{$(op).disabled=true;try{note(op==='connectReminders'?'请在 macOS 提示中允许 BBReader Helper 访问提醒事项。':'正在同步提醒事项…');await api({op});await refresh();note(state.remindersStatus);}finally{$(op).disabled=false;}});
 for(const id of ['bannerLogin','onboardLogin'])$(id).onclick=()=>run(async()=>{await api({op:'openLogin'});note('完成学校登录后，点击“立即检查”。');});
 $('message').onclick=()=>note('');
@@ -295,7 +394,9 @@ $('authForm').onsubmit=event=>{
     if(!username||!password)throw new Error('请填写校园账号和密码');
     try{
       if(!(await chrome.permissions.request({origins:[CAS_PERMISSION]})))throw new Error('未授权学校认证页面访问');
-      await api({op:'saveCredentials',username,password});await refresh();note('账号已保存，自动登录已开启。');
+      await api({op:'saveCredentials',username,password});
+      $('casPassword').value='';
+      await api({op:'sync'});await refresh();note('账号已保存，正在连接学校并扫描课程；自动下载按课程选择执行。');
     }finally{$('casPassword').value='';}
   });
 };
@@ -308,7 +409,7 @@ updateAuthControls();
 $('feed').onclick=()=>run(async()=>{const r=await api({op:'feed'});$('feedURL').value=r.url;$('feedBox').hidden=false;});$('copyFeed').onclick=()=>run(async()=>{await navigator.clipboard.writeText($('feedURL').value);note('链接已复制，可以粘贴到日历软件的订阅中。');});
 $('export').onclick=()=>{const list=activeAssignments();download('BBReader.ics',makeICS(list,state.account||'local'),'text/calendar;charset=utf-8');note(`已导出 ${list.filter(a=>a.due).length} 项带截止时间的作业。`);};
 $('exportNotes').onclick=()=>{const notes=Object.entries(state.notes||{}).map(([url,n])=>`# ${state.courses.find(c=>c.id===n.courseId)?.name||''} / ${n.path.join(' / ')}\n\n${url}\n\n${n.items.map(i=>`## ${i.title}\n\n${i.body}\n\n${i.links.map(l=>`${l.title}: ${l.url}`).join('\n')}`).join('\n\n')}`).join('\n\n---\n\n');download('课程文字与链接.txt',notes||'尚无课程文字内容。','text/plain;charset=utf-8');};
-$('reset').onclick=()=>run(async()=>{if(confirm('清空本地课程与作业索引？已归档的文件不会删除。')){await api({op:'reset'});courseDraft=null;await refresh();}});
+$('reset').onclick=()=>run(async()=>{if(confirm('清空本地课程与作业索引？已归档的文件不会删除。')){await api({op:'reset'});courseDraft=null;autoDownloadDraft=null;await refresh();}});
 // Appearance: palette + light/dark mode, stored per browser (see theme.js for first paint).
 const THEMES=[['navy','墨蓝','默认 · 沉稳学院蓝','#1d5fbf','#e3edfa'],['indigo','靛蓝','现代 · 偏紫的蓝','#4f5bd5','#e8eafc'],['teal','青绿','原配色','#1f6f5c','#e3f0e8'],['terracotta','陶土','温暖 · 米色纸张','#c2562b','#fbe9df'],['graphite','石墨','极简 · 黑白灰','#18181b','#e9e9ec']];
 function readTheme(){try{return JSON.parse(localStorage.getItem('bbreader-theme')||'{}');}catch{return {};}}

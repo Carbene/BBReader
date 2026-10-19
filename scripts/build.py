@@ -7,7 +7,7 @@ parser = argparse.ArgumentParser(description='Build the browser extension and op
 parser.add_argument('--browser-only', action='store_true', help='Package the extension without Swift or macOS tools')
 args = parser.parse_args()
 manifest = ROOT / 'extension/manifest.json'
-data = json.loads(manifest.read_text())
+data = json.loads(manifest.read_text(encoding='utf-8'))
 if not data.get('key'):
     # Only the public key is kept. It fixes the unpacked extension ID across builds.
     with tempfile.TemporaryDirectory() as temp:
@@ -15,7 +15,7 @@ if not data.get('key'):
         subprocess.run(['openssl','genrsa','-out',str(key),'2048'],check=True,capture_output=True)
         public = subprocess.check_output(['openssl','rsa','-in',str(key),'-pubout','-outform','DER'],stderr=subprocess.DEVNULL)
     data['key'] = base64.b64encode(public).decode()
-    manifest.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
+    manifest.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
 extension_id = ''.join(chr(ord('a')+int(c,16)) for c in hashlib.sha256(base64.b64decode(data['key'])).hexdigest()[:32])
 IGNORE = shutil.ignore_patterns('.DS_Store','__pycache__','*.log')
 def fresh(path):

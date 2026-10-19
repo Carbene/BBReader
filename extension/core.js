@@ -11,6 +11,10 @@ export function nextCheck(now = Date.now(), time) { const t = checkToday(now, ti
 export function dailyDue(lastDay, now = Date.now(), time) { return now >= checkToday(now, time) && lastDay !== campusDay(now); }
 export const nineToday = now => checkToday(now);
 export const nextNine = now => nextCheck(now);
+// Files the user chose to ignore are treated as already handled: they never join a download
+// batch and stay out of the file totals until the archive view reveals them again.
+export const isIgnoredFile = file => file?.ignored === true;
+export const isHandledFile = file => isIgnoredFile(file) || Boolean(file?.savedPath || file?.browserDownload?.path);
 export function cleanName(s) {
   const value=String(s || '未命名').normalize('NFC').replace(/[\x00-\x1f\x7f/:\\<>"|?*]/g, '_').trim().replace(/^[\s._\-–—•·]+/, '').replace(/[.\s]+$/, '');
   const suffix=value.match(/\.[a-z0-9]{1,12}$/i)?.[0]||'',stem=value.slice(0,value.length-suffix.length);

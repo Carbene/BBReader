@@ -35,17 +35,25 @@ test('daily password limit and failure pause do not retrieve a password',async()
 });
 
 test('a working SSO browser session succeeds without retrieving credentials',async()=>{
-  let state={},reads=0,closed=false;
+  let state={authBlocked:true},reads=0,closed=false;
   globalThis.chrome={permissions:{contains:async()=>false},tabs:{create:async()=>({id:42}),get:async()=>({status:'complete',url:'https://bb.sustech.edu.cn/webapps/portal/execute/tabs/tabAction'}),remove:async()=>{closed=true;}},scripting:{executeScript:async()=>[{result:true}]}};
   await renewLogin({get:async()=>state,put:async s=>state=s,native:async()=>{reads++;}});
-  assert.equal(reads,0);assert.equal(closed,true);assert.equal(state.authStatus,'统一认证连接正常');
+  assert.equal(reads,0);assert.equal(closed,true);assert.equal(state.authStatus,'统一认证连接正常');assert.equal(state.authBlocked,true,'background SSO reuse cannot silently resume password retries');
 });
 
-test('explicit credential check renews authentication once and clears the pause only after successful password login',async()=>{
+test('manual connection check reuses SSO without forcing password submission',async()=>{
+  let state={credentialLogin:true,authBlocked:true},createdURL,reads=0;
+  globalThis.chrome={permissions:{contains:async()=>true},tabs:{create:async o=>{createdURL=o.url;return{id:42};},get:async()=>({status:'complete',url:SSO}),remove:async()=>{}},scripting:{executeScript:async()=>[{result:true}]}};
+  await renewLogin({manual:true,get:async()=>state,put:async s=>state=s,native:async()=>{reads++;}});
+  assert.equal(createdURL,SSO);assert.equal(reads,0);assert.equal(state.authBlocked,false,'an explicit successful connection check resumes future automatic login; the daily submission limit still applies');
+  assert.equal(state.authStatus,'统一认证连接正常');
+});
+
+test('explicit connection check retries a needed password login once and clears the pause after success',async()=>{
   let state={credentialLogin:true,authBlocked:true},createdURL,reads=0,scripts=0,polls=0;
   globalThis.chrome={permissions:{contains:async()=>true},tabs:{create:async o=>{createdURL=o.url;return{id:42};},get:async()=>({status:'complete',url:polls++===0?'https://cas.sustech.edu.cn/cas/login':'https://bb.sustech.edu.cn/webapps/portal/execute/tabs/tabAction'}),remove:async()=>{}},scripting:{executeScript:async()=>[{result:['ready','submitted',true][scripts++]}]}};
   await renewLogin({manual:true,get:async()=>state,put:async s=>state=s,native:async()=>{reads++;return{configured:true,username:'fixture',password:'not-a-real-password'};}});
-  assert.equal(new URL(createdURL).searchParams.get('renew'),'true');assert.equal(reads,1);assert.equal(state.authBlocked,false);assert.match(state.authStatus,/已使用保存的凭据/);
+  assert.equal(createdURL,SSO,'connection checks reuse SSO before submitting a password');assert.equal(reads,1);assert.equal(state.authBlocked,false);assert.match(state.authStatus,/已使用保存的凭据/);
 });
 
 test('browser mode never reads legacy saved credentials',async()=>{
@@ -61,4 +69,11 @@ test('browser mode fills CAS from the encrypted browser vault, not the macOS hel
     scripting:{executeScript:async({args})=>{if(args?.[0])filled={...args[0]};return [{result:['ready','submitted',true][scripts++]}];}}};
   await renewLogin({manual:true,get:async()=>state,put:async s=>state=s,native:async()=>{nativeReads++;},readCredentials:async()=>{vaultReads++;return {configured:true,username:'fixture',password:'vault-password'};}});
   assert.equal(nativeReads,0);assert.equal(vaultReads,1);assert.deepEqual(filled,{username:'fixture',password:'vault-password'});assert.match(state.authStatus,/已使用保存的凭据/);
+});
+
+for(const [raw,message] of [['No tab with id: 42','学校登录页面已关闭'],['Frame with ID 0 is showing error page','学校页面加载失败']])test('login reports '+message+' without reading credentials',async()=>{
+  let state={credentialLogin:true},reads=0;
+  globalThis.chrome={permissions:{contains:async()=>true},tabs:{create:async()=>({id:42}),get:async()=>{throw Error(raw);},remove:async()=>{} }};
+  await assert.rejects(renewLogin({get:async()=>state,put:async s=>state=s,native:async()=>{reads++;}}),new RegExp(message));
+  assert.equal(reads,0);assert.match(state.authStatus,new RegExp(message));assert.equal(state.authBlocked,undefined);
 });
