@@ -1,5 +1,5 @@
 import {courseSettingsURL,selectCurrentCourses} from './courses.js';
-import {CAS_PERMISSION,SSO,renewLogin} from './auth.js';
+import {CAS_PERMISSION,SSO,renewLogin,loginError,navigationFailure} from './auth.js';
 import {saveVault,readVault,deleteVault,validCredentials} from './vault.js';
 import { ORIGIN, PORTAL, DAY, campusDay, dailyDue, nextCheck, checkTime, cleanName, sameAccountLabel, browserFilename, readURL, bbURL, digest, calendarDate, attachmentName, isIgnoredFile } from './core.js';
 const HOST = 'cn.sustech.bbreader', DAILY = 'daily-nine', RESUME = 'resume-job';
@@ -68,8 +68,8 @@ async function discover(retry = true) {
     const identity=await parse(await profile.text(),profile.url,'identity');
     return {label:result.label,person:result.person,...identity,...selectCurrentCourses(enrollment)};
   } catch(e) {
-    if(retry&&/重新登录/.test(e.message)){await renew();return discover(false);}
-    throw e;
+    if(retry&&(/重新登录/.test(e.message)||navigationFailure(e))){await renew();return discover(false);}
+    throw loginError(e);
   } finally { await chrome.tabs.remove(tab.id).catch(()=>{}); }
 }
 async function arm() { await chrome.alarms.create(DAILY,{when:nextCheck(Date.now(),(await get()).checkTime)}); }
@@ -88,6 +88,7 @@ async function start(automatic = false) {
     if (s.account && (s.accountIdentity?s.accountIdentity!==identity:!sameAccountLabel(s.accountLabel,found.label,found.person))) {
       throw new Error('检测到不同 Blackboard 账户。请先在设置中清空本地索引，再连接该账户。已有文件不会删除。');
     }
+    s.authStatus='统一认证连接正常';s.lastError=null;
     s.account ||= identity;s.accountIdentity=identity;s.accountLabel = found.label;s.currentTerm=found.term;
     s.courses = found.courses.map(c=>({...c,enabled:s.courses.find(old=>old.id===c.id)?.enabled !== false,autoDownload:s.courses.find(old=>old.id===c.id)?.autoDownload === true}));
     const chosen = s.courses.filter(c=>c.enabled);

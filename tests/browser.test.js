@@ -34,7 +34,15 @@ test('Windows scan indexes only; explicit file batches download, resume safely a
  try{
   db.state={account:(await digest('Fixture')).slice(0,24),accountLabel:'Fixture',courses:[],assignments:[],files:{},warnings:[],enabled:true,integrationMode:'macos',credentialLogin:true,remindersEnabled:true};
   assert.equal((await ask({op:'state'})).state.integrationMode,'browser');
+  const originalScript=chrome.scripting.executeScript;let portalAttempts=0;
+  chrome.scripting.executeScript=async options=>{
+    if(portalAttempts++===0)throw Error('Frame with ID 0 is showing error page');
+    return originalScript(options);
+  };
   await ask({op:'sync'});await settle(()=>db.state.job?.gradesQueued);
+  chrome.scripting.executeScript=originalScript;
+  assert.equal(portalAttempts,3,'a failed portal load recovers through SSO and retries discovery once');
+  assert.equal(db.state.authStatus,'统一认证连接正常');
   chrome.alarms.onAlarm.listeners[0]({name:'resume-job'});await settle(()=>db.state.lastSync&&!db.state.job);
   assert.equal(Object.keys(db.state.files).length,2);assert.equal(downloadCalls,0,'index scans never download attachments');assert.equal(nativeCalls,0);
   const keys=Object.keys(db.state.files);

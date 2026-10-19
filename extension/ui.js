@@ -288,7 +288,7 @@ function render(){
   // Keychain on macOS integration; otherwise the encrypted browser vault (see vault.js).
   const keychain=state.integrationMode==='macos',saved=keychain?state.credentialLogin===true:state.browserCredentialLogin===true;
   $('authStatus').textContent=state.authStatus||(saved?'已保存账号：登录过期时自动登录，每日最多尝试一次。':'复用当前浏览器的学校登录状态；也可保存账号，登录过期时自动登录。');
-  $('authBadge').textContent=saved&&state.authBlocked?'需要重新连接':saved?'自动登录已开启':'浏览器登录';
+  $('authBadge').textContent=saved&&state.authBlocked?'密码自动重试已暂停':saved?'自动登录已开启':'浏览器登录';
   $('authBadge').dataset.state=saved&&state.authBlocked?'paused':saved?'enabled':'browser';
   $('credentialNote').textContent=keychain?'密码保存在本机钥匙串，仅用于学校统一认证。':'密码经加密保存在当前 Chrome 配置中，仅用于学校统一认证；安全性低于系统钥匙串。';
   $('keychainHint').hidden=keychain||platformOS!=='mac';
@@ -391,7 +391,9 @@ $('authForm').onsubmit=event=>{
     if(!username||!password)throw new Error('请填写校园账号和密码');
     try{
       if(!(await chrome.permissions.request({origins:[CAS_PERMISSION]})))throw new Error('未授权学校认证页面访问');
-      await api({op:'saveCredentials',username,password});await refresh();note('账号已保存，自动登录已开启。');
+      await api({op:'saveCredentials',username,password});
+      $('casPassword').value='';
+      await api({op:'sync'});await refresh();note('账号已保存，正在连接学校并扫描课程；自动下载按课程选择执行。');
     }finally{$('casPassword').value='';}
   });
 };
