@@ -12,9 +12,10 @@ const get = async () => {
   return s;
 };
 const put = state => chrome.storage.local.set({state});
-async function native(message) {
+async function native(message,host=HOST) {
   if((await platform).os!=='mac')throw new Error('系统集成仅支持 macOS');
-  const r = await chrome.runtime.sendNativeMessage(HOST, message);
+  if(typeof chrome.runtime.sendNativeMessage!=='function')throw new Error('本地助手权限尚未生效，请重新加载 BBReader 后再启用系统集成');
+  const r = await chrome.runtime.sendNativeMessage(host, message);
   if (!r?.ok) throw new Error(r?.error || '本地助手未响应'); return r;
 }
 // Credentials come from the Keychain helper on macOS integration, otherwise from the encrypted browser vault.
@@ -475,7 +476,21 @@ async function ensureDownloadUpgrade(){
 }
 async function wake() { await arm();await ensureDownloadUpgrade();const migration=(await chrome.storage.local.get('directoryMigration')).directoryMigration;if(migration&&!migration.committed)await runDirectoryMigration(migration).catch(()=>{});const s=await get();if(s.job)await pump();else await start(true);await downloadBatch(); }
 chrome.runtime.onStartup.addListener(()=>wake());
-chrome.runtime.onInstalled.addListener(({reason}={})=>{wake().catch(()=>{});if(reason==='install')chrome.tabs.create({url:'index.html'});});
+async function installed({reason}={}) {
+  if((await chrome.storage.local.get('integrationReload')).integrationReload){
+    // Consume before retrying so a failed host never causes a reload loop.
+    await chrome.storage.local.remove('integrationReload');
+    try{await setIntegration('macos');}
+    catch(e){const s=await get();s.integrationError=`系统集成未启用：${e.message}`;await put(s);}
+    await chrome.tabs.create({url:'index.html#/settings'});return;
+  }
+  await wake();if(reason==='install')await chrome.tabs.create({url:'index.html'});
+}
+async function setIntegration(mode){
+  if(mode==='macos')await native({op:'status'});
+  const s=await get();s.integrationMode=mode;delete s.integrationError;s.authBlocked=false;s.authStatus=null;s.downloadStatus='运行模式已更新，下次检查按此模式保存';await put(s);
+}
+chrome.runtime.onInstalled.addListener(details=>installed(details).catch(()=>{}));
 chrome.action.onClicked.addListener(()=>chrome.tabs.create({url:'index.html'}));
 chrome.runtime.onMessage.addListener((msg,sender,reply)=>{
   if(sender.id!==chrome.runtime.id || !sender.url?.startsWith(chrome.runtime.getURL('index.html')) || msg.target==='parser')return;
@@ -485,8 +500,14 @@ chrome.runtime.onMessage.addListener((msg,sender,reply)=>{
       if(running||downloading||reconciling||syncingReminders||(await get()).job||Object.keys((await chrome.storage.local.get('pending')).pending||{}).length)throw new Error('请等待当前检查和下载结束');
       running=true;
       try {
-        if(msg.mode==='macos')await native({op:'status'});
-        const s=await get();s.integrationMode=msg.mode;s.authBlocked=false;s.authStatus=null;s.downloadStatus='运行模式已更新，下次检查按此模式保存';await put(s);return {ok:true};
+        if(msg.mode==='macos'){
+          if((await platform).os!=='mac')throw new Error('系统集成仅支持 macOS');
+          if(!await chrome.permissions.contains({permissions:['nativeMessaging']}))throw new Error('未允许连接本地助手，请重新启用系统集成并授权');
+          if(typeof chrome.runtime.sendNativeMessage!=='function'){
+            await chrome.storage.local.set({integrationReload:true});return {ok:true,reloadRequired:true};
+          }
+        }
+        await setIntegration(msg.mode);return {ok:true};
       } finally {running=false;}
     }
     if(msg.op==='completeAssignment'){
@@ -546,7 +567,7 @@ chrome.runtime.onMessage.addListener((msg,sender,reply)=>{
         const config=await native({op:'status'});
         if(!config.capabilities?.includes('confirmed-directory-migration')||!config.capabilities?.includes('migration-journal'))throw new Error('请先重新运行 0.4.0 安装包中的“安装本地助手.command”');
         let chosen;
-        try {chosen=await chrome.runtime.sendNativeMessage('cn.sustech.bbreader.picker',{op:'chooseFolder',title:course?`选择 ${course.name} 的保存文件夹`:'选择课件保存根目录',directory:course?config.courses?.[course.id]||config.root:config.root});}
+        try {chosen=await native({op:'chooseFolder',title:course?`选择 ${course.name} 的保存文件夹`:'选择课件保存根目录',directory:course?config.courses?.[course.id]||config.root:config.root},'cn.sustech.bbreader.picker');}
         catch {throw new Error('文件夹选择器未连接，请运行最新版安装包中的“安装本地助手.command”');}
         if(!chosen?.ok)throw new Error(chosen?.error||'文件夹选择器未响应');
         if(chosen.cancelled)return {ok:true,cancelled:true};

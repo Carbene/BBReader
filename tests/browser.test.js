@@ -266,3 +266,30 @@ test('cancel during download creation cancels the late ID and keeps the batch te
   assert.equal((await ask({op:'resumeDownloads',batchId})).ok,false);
  } finally {chrome.downloads.download=oldDownload;}
 });
+
+test('optional native permission reloads once and enables integration only after host verification',async()=>{
+ const oldNative=chrome.runtime.sendNativeMessage,oldContains=chrome.permissions.contains,oldCreate=chrome.tabs.create;
+ const opened=[];os='mac';db.pending={};db.state={integrationMode:'browser',courses:[],files:{},assignments:[],warnings:[]};
+ chrome.tabs.create=async tab=>{opened.push(tab.url);return{id:99};};
+ try{
+  delete chrome.runtime.sendNativeMessage;
+  chrome.permissions.contains=async()=>false;
+  assert.equal((await ask({op:'integration',mode:'macos'})).ok,false);
+  assert.equal(db.integrationReload,undefined,'no reload without permission');
+  chrome.permissions.contains=async()=>true;
+  const r=await ask({op:'integration',mode:'macos'});
+  assert.equal(r.reloadRequired,true);assert.equal(db.integrationReload,true);
+  assert.equal(db.state.integrationMode,'browser','do not claim the helper works yet');
+  chrome.runtime.sendNativeMessage=async(host,msg)=>{assert.equal(host,'cn.sustech.bbreader');assert.deepEqual(msg,{op:'status'});return{ok:true};};
+  chrome.runtime.onInstalled.listeners[0]({reason:'update'});
+  await settle(()=>opened.length===1);
+  assert.equal(db.integrationReload,undefined);assert.equal(db.state.integrationMode,'macos');
+  assert.equal(opened[0],'index.html#/settings');
+  db.state.integrationMode='browser';db.integrationReload=true;
+  delete chrome.runtime.sendNativeMessage;
+  chrome.runtime.onInstalled.listeners[0]({reason:'update'});
+  await settle(()=>opened.length===2);
+  assert.equal(db.integrationReload,undefined,'failed recovery cannot loop');
+  assert.equal(db.state.integrationMode,'browser');assert.match(db.state.integrationError,/重新加载/);
+ }finally{chrome.runtime.sendNativeMessage=oldNative;chrome.permissions.contains=oldContains;chrome.tabs.create=oldCreate;}
+});

@@ -61,7 +61,7 @@ function renderIntegration(){
   document.querySelectorAll('[data-integrated]').forEach(e=>e.hidden=!integrated);
   $('modeBadge').textContent=integrated?'macOS 系统集成':'浏览器独立模式';
   $('modeBadge').dataset.state=integrated?'enabled':'browser';
-  $('modeDescription').textContent=integrated?'使用本地助手归档课件，可连接钥匙串与 Apple 提醒事项。':'无需安装本地助手，课件直接保存到浏览器下载目录。';
+  $('modeDescription').textContent=state.integrationError||(integrated?'使用本地助手归档课件，可连接钥匙串与 Apple 提醒事项。':'无需安装本地助手，课件直接保存到浏览器下载目录。');
   $('toggleIntegration').textContent=integrated?'切换为浏览器独立模式':'启用 macOS 系统集成';
   $('browserDownloadHint').hidden=integrated;
   $('helper').textContent=integrated?(archiveConfig.error|| (archiveConfig.root?`归档根目录：${archiveConfig.root}`:'本地助手已连接，请选择保存文件夹。')):'浏览器下载目录 / BBReader / 学期 / 课程 / 内容目录';
@@ -363,7 +363,7 @@ $('toggleIntegration').onclick=()=>run(async()=>{
   const mode=state.integrationMode==='macos'?'browser':'macos';
   if(mode==='macos'&&!demo&&!(await chrome.permissions.request({permissions:['nativeMessaging']})))throw new Error('未允许连接本地助手');
   $('toggleIntegration').disabled=true;
-  try{await api({op:'integration',mode});await refresh();renderCourses();note('运行模式已更新，现有文件与系统配置均保留。');}finally{$('toggleIntegration').disabled=false;}
+  try{const result=await api({op:'integration',mode});if(result.reloadRequired){note('正在重新加载扩展以应用本地助手权限…');chrome.runtime.reload();return;}await refresh();renderCourses();note('运行模式已更新，现有文件与系统配置均保留。');}finally{$('toggleIntegration').disabled=false;}
 });
 $('chooseRoot').onclick=()=>run(async()=>{$('chooseRoot').disabled=true;try{note('请在 macOS 窗口中选择保存文件夹。');await changeDirectory('chooseRoot');}finally{$('chooseRoot').disabled=false;}});
 $('retryMigration').onclick=()=>run(async()=>{const r=await api({op:'retryMigration'});await refresh();note(`迁移重试完成：迁移 ${r.migrated} 个文件${r.failed?`，仍有 ${r.failed} 个失败`:''}。`);});
